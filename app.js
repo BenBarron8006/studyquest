@@ -210,27 +210,7 @@ const totalReviews = () => Object.values(S.days).reduce((a, d) => a + (d.reviews
 const totalMin = () => Object.values(S.days).reduce((a, d) => a + (d.minutes || 0), 0);
 const bestZ = () => S.zetamac.reduce((m, z) => Math.max(m, z.score), 0);
 const courseDone = (id) => { const c = courses().find((x) => x.id === id); return c && c.units.length && c.units.every((u) => S.units[u.id]?.mastered); };
-const BADGES = [
-  { id: "first-step", name: "First step", icon: "👣", test: () => Object.values(S.units).some((u) => Object.keys(u.steps).length) },
-  { id: "first-boss", name: "Boss slayer", icon: "🐉", test: () => Object.values(S.units).some((u) => u.mastered) },
-  { id: "full-day", name: "Full session", icon: "🗓️", test: () => Object.values(S.days).some((d) => d.sessionDone) },
-  { id: "polymath", name: "4 subjects in a day", icon: "🎓", test: () => Object.values(S.days).some((d) => Object.keys(d.blocks || {}).length >= 4) },
-  { id: "streak7", name: "7-day streak", icon: "🔥", test: () => S.streak.count >= 7 },
-  { id: "streak30", name: "30-day streak", icon: "🌋", test: () => S.streak.count >= 30 },
-  { id: "rev100", name: "100 reviews", icon: "🧠", test: () => totalReviews() >= 100 },
-  { id: "rev1000", name: "1,000 reviews", icon: "🏛️", test: () => totalReviews() >= 1000 },
-  { id: "z45", name: "Zetamac 45", icon: "⚡", test: () => bestZ() >= 45 },
-  { id: "z55", name: "Zetamac 55", icon: "⚡⚡", test: () => bestZ() >= 55 },
-  { id: "z65", name: "Zetamac 65", icon: "🏎️", test: () => bestZ() >= 65 },
-  { id: "puzzle10", name: "Puzzle hunter", icon: "🧩", test: () => Object.values(S.puzzles).filter((p) => p.solved).length >= 10 },
-  { id: "ling-done", name: "Linguist", icon: "🗣️", test: () => courseDone("ling") },
-  { id: "prob-done", name: "Probabilist", icon: "🎲", test: () => courseDone("prob") },
-  { id: "course-any", name: "Course complete", icon: "🏆", test: () => courses().some((c) => courseDone(c.id)) },
-  { id: "builder", name: "Course builder", icon: "🧱", test: () => allPacks().some((p) => p.origin === "custom") },
-  { id: "focus10h", name: "10 focused hours", icon: "⏱️", test: () => totalMin() >= 600 },
-  { id: "focus100h", name: "100 focused hours", icon: "🏔️", test: () => totalMin() >= 6000 },
-];
-function checkBadges() { for (const b of BADGES) if (!S.badges[b.id] && b.test()) { S.badges[b.id] = dayKey(); setTimeout(() => celebrate(`${b.icon} Badge: ${b.name}`, "Added to your trophy case."), 900); } }
+function checkBadges() {}
 
 /* ============================== Spaced repetition (FSRS-4.5 default weights) ============================== */
 const W = [0.4872, 1.4003, 3.7145, 13.8206, 5.1618, 1.2298, 0.8975, 0.031, 1.6474, 0.1367, 1.0461, 2.1072, 0.0793, 0.3246, 1.587, 0.2272, 2.8755];
@@ -1087,8 +1067,7 @@ function vGoals() {
     <p class="muted">A unit is “due” on its target date. Change dates per course in Courses.</p></section>
   <section class="card"><h2>Mental math</h2>${spark(S.zetamac.slice(-30).map((z) => z.score), S.goals.zetamac)}<p class="muted">Best ${bestZ() || "—"} · targets: 45 by Feb, 55 by May, 65+ by Aug</p></section>
   <section class="card"><h2>Weekly review</h2><textarea id="wrev" rows="4" placeholder="What worked? What didn't? One commitment for next week.">${esc(S.weeklyReviews[thisWeek] || "")}</textarea><button data-act="save-wrev">Save${S.weeklyReviews[thisWeek] ? "" : " (+30 XP)"}</button>
-    ${Object.entries(S.weeklyReviews).filter(([k]) => k !== thisWeek).slice(-4).reverse().map(([k, v]) => `<details><summary>${k}</summary><p>${esc(v)}</p></details>`).join("")}</section>
-  <section class="card"><h2>Trophy case</h2><div class="badges">${BADGES.map((b) => `<div class="badge ${S.badges[b.id] ? "got" : ""}"><span>${b.icon}</span><small>${b.name}</small></div>`).join("")}</div></section>`;
+    ${Object.entries(S.weeklyReviews).filter(([k]) => k !== thisWeek).slice(-4).reverse().map(([k, v]) => `<details><summary>${k}</summary><p>${esc(v)}</p></details>`).join("")}</section>`;
 }
 function vMethod() {
   return `<section class="hero"><h1>Why this works</h1><p>${esc(METHOD.intro)}</p></section>
