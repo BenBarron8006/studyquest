@@ -3,6 +3,7 @@ import { LIBRARY, PACK_PROMPT } from "./library.js";
 import { METHOD } from "./method.js";
 import { LESSONS, LESSON_PROMPT } from "./lessons.js";
 import { GEN, checkAnswer } from "./gens.js";
+import { PUZZLE_BANK, puzzleSet, genPuzzle, genSequence, genBet, genBlitz } from "./games.js";
 
 /* ============================== Storage ============================== */
 let dbp = null;
@@ -313,41 +314,58 @@ function modal(html, cls = "") { closeModal(); const m = document.createElement(
 let openURLs = [];
 function closeModal() { const m = $("#modal"); if (m) { m.querySelectorAll("video").forEach((v) => v.pause()); m.remove(); } openURLs.forEach((u) => URL.revokeObjectURL(u)); openURLs = []; }
 
-/* ============================== Focus timer ============================== */
-function startTimer(uid, mins, block) { S.timer = { start: Date.now(), unit: uid || null, target: mins, block: block || null }; save(); renderTimer(); toast(`⏱️ ${mins}-minute block started`); }
-function stopTimer() {
-  if (!S.timer) return;
-  const t = S.timer, m = Math.round((Date.now() - t.start) / 60000);
-  S.timer = null;
-  const d = today();
-  if (m >= 1) {
-    d.minutes += m;
-    const u = t.unit ? unitById(t.unit) : null;
-    if (u) { const us = unitState(u.id); us.minutes = (us.minutes || 0) + m; d.courseMin[u.course.id] = (d.courseMin[u.course.id] || 0) + m; }
-    const xp = Math.min(m, Math.max(0, 240 - (d.focusXp || 0)));
-    d.focusXp = (d.focusXp || 0) + xp;
-    addXP(xp, `${m} focused min`);
-    if (t.block && m >= Math.round(t.target * 0.7) && !d.blocks[t.block]) completeBlock(t.block);
-  }
-  save(); renderTimer(); render();
+/* ============================== Automatic time tracking ============================== */
+// Time counts only while you're on a learning screen, the app is visible, and you've touched or typed in the
+// last 2 minutes. No start/stop buttons, nothing to self-report.
+const IDLE_MS = 120000, LEARN_VIEWS = ["lesson", "diag", "practice", "boss", "review", "tutor", "arena"];
+let lastInput = Date.now(), trackCtx = null;
+const acc = {};
+["pointerdown", "keydown", "wheel", "touchstart", "input"].forEach((ev) => document.addEventListener(ev, () => (lastInput = Date.now()), { passive: true, capture: true }));
+function learningContext() {
+  const { view, arg } = route();
+  if (!LEARN_VIEWS.includes(view) && !(view === "unit" && $("#modal"))) return null;
+  if (view === "arena") return { kind: "arena", label: "Arena" };
+  if (view === "tutor") return tutor.unit && unitById(tutor.unit) ? { unit: tutor.unit } : { kind: "tutor", label: "Tutor" };
+  if (view === "review" || (view === "practice" && arg === "all")) return cur?.u ? { unit: cur.u.id } : { kind: "review", label: "Review" };
+  return unitById(arg) ? { unit: arg } : null;
 }
+function creditMinute(c) {
+  const d = today();
+  d.minutes++;
+  const u = c.unit ? unitById(c.unit) : null;
+  if (u) {
+    const us = unitState(u.id); us.minutes = (us.minutes || 0) + 1;
+    const cid = u.course.id; d.courseMin[cid] = (d.courseMin[cid] || 0) + 1;
+    const b = planToday().blocks.find((x) => x.course.id === cid);
+    if (b && !d.blocks[cid] && d.courseMin[cid] >= b.minutes) completeBlock(cid);
+  } else if (c.kind === "arena") d.arenaMin = (d.arenaMin || 0) + 1;
+  if ((d.focusXp || 0) < 240) { d.focusXp = (d.focusXp || 0) + 1; S.xp++; d.xp++; }
+  markActive(); save(); renderHeader();
+}
+setInterval(() => {
+  const ctx = learningContext(), active = ctx && document.visibilityState === "visible" && Date.now() - lastInput < IDLE_MS;
+  trackCtx = ctx ? { ...ctx, active } : null;
+  if (active) { const k = ctx.unit || ctx.kind; acc[k] = (acc[k] || 0) + 5; if (acc[k] >= 60) { acc[k] -= 60; creditMinute(ctx); } }
+  renderTimer();
+}, 5000);
 function completeBlock(cid) {
   const d = today();
   d.blocks[cid] = dayKey();
   addXP(10, "Block complete");
   const p = planToday();
   if (!d.sessionDone && p.blocks.length && p.blocks.every((b) => d.blocks[b.course.id])) { d.sessionDone = true; addXP(40, "Full session"); celebrate("🗓️ Session complete", "Every subject got its turn today."); }
+  else { const next = p.blocks.find((b) => !d.blocks[b.course.id]); toast(next ? `✅ Block done. Next up: ${next.course.name}` : "✅ Block done"); }
 }
 function renderTimer() {
   const bar = $("#timerbar");
-  if (!S.timer) { bar.hidden = true; return; }
+  if (!trackCtx) { bar.hidden = true; return; }
   bar.hidden = false;
-  const el = Math.floor((Date.now() - S.timer.start) / 1000), left = S.timer.target * 60 - el;
-  const u = S.timer.unit ? unitById(S.timer.unit) : null;
-  bar.innerHTML = `<span>⏱️ ${left >= 0 ? "" : "Overtime "}${Math.floor(Math.abs(left) / 60)}:${pad(Math.abs(left) % 60)}${u ? " · " + esc(u.course.emoji + " " + u.title) : ""}</span><button data-act="stop-timer">Stop &amp; log</button>`;
-  if (left === 0) { try { navigator.vibrate?.(300); } catch {} toast("⏰ Block done: 5-minute break, then the next subject"); }
+  const u = trackCtx.unit ? unitById(trackCtx.unit) : null, d = today();
+  let txt;
+  if (u) { const b = planToday().blocks.find((x) => x.course.id === u.course.id), m = d.courseMin[u.course.id] || 0; txt = `${u.course.emoji} ${esc(u.course.name)}: ${m}${b ? ` / ${b.minutes}` : ""} min today${b && d.blocks[u.course.id] ? " ✅" : ""}`; }
+  else txt = `${esc(trackCtx.label)}: ${trackCtx.kind === "arena" ? d.arenaMin || 0 : d.minutes} min`;
+  bar.innerHTML = `<span>${trackCtx.active ? "⏱️" : "⏸️"} ${txt}${trackCtx.active ? "" : " · paused, no activity"}</span>`;
 }
-setInterval(() => S.timer && renderTimer(), 1000);
 
 /* ============================== Router ============================== */
 const NAV = [["today", "🏠", "Today"], ["map", "🗺️", "Map"], ["review", "🧠", "Review"], ["arena", "⚔️", "Arena"], ["tutor", "🤖", "Tutor"], ["more", "☰", "More"]];
@@ -394,7 +412,7 @@ function vToday() {
       <div class="dot" style="background:${b.course.color}">${b.course.emoji}</div>
       <div class="grow" data-go="${stepRoute(b.unit.id)}"><b>${esc(b.course.name)} · ${b.minutes} min</b>
         <div class="muted">${esc(b.unit.title)} · ${b.step ? b.step.icon + " " + b.step.name : "Review & apply"}${b.unit.target < dayKey() ? ' · <span class="late">behind</span>' : ""}</div></div>
-      ${b.done ? `<span class="pill ok">done</span>` : `<button class="primary" data-act="block-start" data-course="${b.course.id}" data-unit="${b.unit.id}" data-min="${b.minutes}">Start</button><button data-act="block-done" data-course="${b.course.id}">✓</button>`}
+      ${b.done ? `<span class="pill ok">done</span>` : `<span class="muted">${today().courseMin[b.course.id] || 0}/${b.minutes}</span><button class="primary" data-act="block-start" data-unit="${b.unit.id}">Go</button>`}
     </div>`;
   return `
   <section class="hero"><h1>${greet}, Ben</h1><p class="muted">${new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} · ${d.xp} XP today · ${d.minutes} focused min</p></section>
@@ -402,7 +420,7 @@ function vToday() {
     <div class="course-head"><h2 class="grow">Today's session · ${p.budget} min</h2>
       <div class="seg"><a data-act="mode" data-mode="term" class="${S.settings.mode === "term" ? "on" : ""}">Term</a><a data-act="mode" data-mode="break" class="${S.settings.mode === "break" ? "on" : ""}">Break</a></div></div>
     <div class="mini wide2"><i style="width:${(done / total) * 100}%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></i></div>
-    <p class="muted">A bit of every subject, in a different order each day. Do the blocks in order; take 5 minutes between them.</p>
+    <p class="muted">A bit of every subject, in a different order each day. Time is counted automatically while you work in the app (it pauses after 2 minutes without activity); a block completes when you reach its minutes.</p>
     <div class="block ${p.warmDone ? "done" : ""}"><div class="bnum">1</div><div class="dot" style="background:#f5a524">⚡</div><div class="grow"><b>Warm-up · ${p.warm} min</b><div class="muted">One 2-minute mental-math run</div></div>${p.warmDone ? `<span class="pill ok">done</span>` : `<button class="primary" data-go="arena/drill">Go</button>`}</div>
     <div class="block ${p.revDone ? "done" : ""}"><div class="bnum">2</div><div class="dot" style="background:#7c5cff">🧠</div><div class="grow"><b>Reviews · ~${p.rev} min</b><div class="muted">${p.due} due (problems and cards), mixed across subjects</div></div>${p.revDone ? `<span class="pill ok">done</span>` : `<button class="primary" data-go="review">Go</button>`}</div>
     ${p.blocks.map(blockRow).join("") || `<p class="muted">No active subjects. Turn some on in <a href="#/courses">Courses</a>.</p>`}
@@ -447,7 +465,7 @@ function vUnit(id) {
   <section class="hero"><a class="back" href="#/map">‹ Map</a><h1>${esc(u.course.emoji)} ${esc(u.title)}</h1>
     <p class="muted">${esc(u.course.name)} · target ${fmtDate(u.target)}${st.minutes ? ` · ${st.minutes} min logged` : ""}${st.mastered ? " · 👑 mastered " + fmtDate(st.mastered) : ""}</p>
     <div class="chips wrap">${u.concepts.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>${str !== null ? `<p class="muted">Memory strength: <b>${str}%</b></p>` : ""}</section>
-  <section class="card row-btns"><button data-act="timer" data-min="25" data-unit="${id}">⏱️ Focus 25</button><button data-act="timer" data-min="50" data-unit="${id}">⏱️ Focus 50</button><button data-act="ask-tutor" data-unit="${id}">🤖 Ask tutor</button></section>
+  <section class="card row-btns"><button data-act="ask-tutor" data-unit="${id}">🎩 Ask the tutor</button></section>
   ${L ? `<section class="card"><h2>Concepts</h2>${L.map((kp, i) => { const ks = S.kps[kp.id] || {}, er = recentErrors(kp.id); return `<div class="cardrow" data-act="lstart" data-unit="${id}" data-k="${i}"><span>${ks.learned ? "✅" : ks.testedOut ? "⏭️" : "⬜"}</span><div class="grow"><b>${esc(kp.title)}</b>${er ? `<div class="muted">missed ${er}× in the last two weeks</div>` : ""}</div><span class="muted">›</span></div>`; }).join("")}</section>` : ""}
   <section class="card"><h2>Mastery loop</h2>
     ${STEPS.map((s, i) => { const done = st.steps[s.id], isNext = !done && nextStep(id)?.id === s.id; return `
@@ -725,12 +743,15 @@ function newProblem() {
   if (k === 2) { drill.a = ri(2, 12); drill.b = ri(2, 100); drill.op = "×"; drill.ans = drill.a * drill.b; }
   if (k === 3) { const x = ri(2, 12), y = ri(2, 100); drill.a = x * y; drill.b = x; drill.op = "÷"; drill.ans = y; }
 }
+const ARENA_TABS = [["drill", "⚡ Mental math"], ["puzzles", "🧩 Brainteasers"], ["markets", "📈 Make a market"], ["bets", "🎲 EV bets"], ["seq", "🔢 Sequences"], ["blitz", "⏱️ Probability blitz"]];
 function vArena(tab = "drill") {
   tab ||= "drill";
-  const head = `<section class="hero"><h1>Arena</h1><p class="muted">Trading-interview training: speed, probability, making markets.</p></section>
-    <div class="tabs">${[["drill", "⚡ Mental math"], ["puzzles", "🧩 Puzzles"], ["markets", "📈 Markets"]].map(([id, n]) => `<a href="#/arena/${id}" class="${tab === id ? "on" : ""}">${n}</a>`).join("")}</div>`;
+  const head = `<section class="hero"><h1>Arena</h1><p class="muted">Trading-interview training: speed, probability, estimation, expected value.</p></section>
+    <div class="tabs">${ARENA_TABS.map(([id, n]) => `<a href="#/arena/${id}" class="${tab === id ? "on" : ""}">${n}</a>`).join("")}</div>`;
   if (tab === "puzzles") return head + vPuzzles();
   if (tab === "markets") return head + vMarkets();
+  if (tab === "bets" || tab === "seq") return head + vRounds(tab);
+  if (tab === "blitz") return head + vBlitz();
   return head + `<section class="card center">${drill.running ? `
       <div class="timer" id="dtime">${Math.max(0, Math.ceil((drill.end - Date.now()) / 1000))}s</div><div class="problem">${drill.a} ${drill.op} ${drill.b} =</div>
       <input id="dans" class="answer" inputmode="numeric" autocomplete="off" autofocus><div class="muted">Score: <b id="dscore">${drill.score}</b></div>` : `
@@ -738,6 +759,39 @@ function vArena(tab = "drill") {
       <p class="muted">Best: <b>${bestZ() || "—"}</b> · Target: <b>${S.goals.zetamac}</b></p>`}</section>
   <section class="card"><h2>History</h2>${spark(S.zetamac.slice(-30).map((z) => z.score), S.goals.zetamac)}
     <div class="inline"><input type="number" id="zman" placeholder="Log a score from zetamac.com" inputmode="numeric"><button data-act="zlog">Log</button></div></section>`;
+}
+// ---- EV bets and sequences: 10-question rounds, checked automatically, with the tutor available.
+let gs = null;
+function vRounds(kind) {
+  if (!gs || gs.kind !== kind) gs = { kind, n: 0, total: 10, right: 0 };
+  S.arena ||= {};
+  const best = S.arena[kind]?.best;
+  const intro = kind === "bets" ? "Each bet: decide whether to take it. Take it only if its expected value (EV) is positive: EV = P(win) × payout − P(lose) × stake. Interviewers use these to see if you think in expectations rather than gut feel." : "Find the next term. Patterns: constant differences, ratios, squares, Fibonacci-style sums, growing differences, primes, alternating rules.";
+  if (gs.n >= gs.total) {
+    if (!gs.saved) { gs.saved = true; S.arena[kind] = { best: Math.max(best || 0, gs.right), plays: (S.arena[kind]?.plays || 0) + 1 }; addXP(5 + gs.right, "Round done"); save(); }
+    return `<section class="card center"><h2>${gs.right}/${gs.total}</h2><p class="muted">Best: ${S.arena[kind].best}/10</p><button class="primary" data-act="g-again">Play again</button></section>`;
+  }
+  if (!cur || cur.mode !== "game" || cur.kind !== kind) cur = { mode: "game", kind, kp: { id: kind, title: kind === "bets" ? "Expected-value bet" : "Number sequence" }, u: null, p: kind === "bets" ? genBet() : genSequence(), answered: null, hint: false, onAnswer: (ok) => { if (ok) gs.right++; } };
+  return `<section class="card"><p class="muted">${intro}</p><div class="course-head"><b class="grow">${gs.n + 1} of ${gs.total} · ${gs.right} right</b>${best != null ? `<span class="muted">best ${best}/10</span>` : ""}</div>${problemHTML()}</section>`;
+}
+// ---- Probability blitz: 60 seconds of quick probability questions. Fractions are fine.
+const bz = { running: false, end: 0, score: 0, p: null, misses: [], t: null };
+function vBlitz() {
+  S.arena ||= {};
+  const best = S.arena.blitz?.best || 0;
+  if (bz.running) return `<section class="card center"><div class="timer" id="btime">${Math.max(0, Math.ceil((bz.end - Date.now()) / 1000))}s</div><p class="pq">${esc(bz.p.q)}</p>
+    <div class="inline"><input id="bans" autocomplete="off" placeholder="e.g. 1/6" autofocus><button class="primary" data-act="bz-check">↵</button></div><div class="muted">Score: <b>${bz.score}</b> · Enter to submit; a wrong answer moves on.</div></section>`;
+  return `<section class="card center"><p>60 seconds of quick probability: dice, coins, cards, independence. Type fractions like 5/36. Wrong answers are listed at the end with solutions.</p><button class="primary big" data-act="bz-start">Start</button><p class="muted">Best: ${best}</p></section>
+    ${bz.misses.length ? `<section class="card"><h2>Last round's misses</h2>${bz.misses.map((m) => `<div class="cardrow"><div class="grow"><b>${esc(m.q)}</b><div class="muted">You: ${esc(m.given)} · ${esc(m.sol)}</div></div></div>`).join("")}</section>` : ""}`;
+}
+function blitzTick() {
+  const left = Math.ceil((bz.end - Date.now()) / 1000), el = $("#btime");
+  if (el) el.textContent = Math.max(0, left) + "s";
+  if (left > 0) return;
+  clearInterval(bz.t); bz.running = false;
+  const pb = bz.score > (S.arena.blitz?.best || 0);
+  S.arena.blitz = { best: Math.max(S.arena.blitz?.best || 0, bz.score) };
+  addXP(5 + bz.score, pb ? `New blitz best: ${bz.score}` : `Blitz: ${bz.score}`); render();
 }
 function drillTick() {
   const left = Math.ceil((drill.end - Date.now()) / 1000), el = $("#dtime");
@@ -756,21 +810,47 @@ function spark(vals, target) {
   const x = (i) => (vals.length === 1 ? w / 2 : (i / (vals.length - 1)) * (w - 20) + 10), y = (v) => h - 10 - (v / max) * (h - 20);
   return `<svg viewBox="0 0 ${w} ${h}" class="spark"><line x1="0" x2="${w}" y1="${y(target)}" y2="${y(target)}" class="tline"/><polyline points="${vals.map((v, i) => `${x(i)},${y(v)}`).join(" ")}" fill="none" class="sline"/>${vals.map((v, i) => `<circle cx="${x(i)}" cy="${y(v)}" r="3.5" class="sdot"/>`).join("")}<text x="${w - 4}" y="${y(target) - 4}" text-anchor="end" class="tlabel">target ${target}</text></svg>`;
 }
+// ---- Brainteasers: a new set every day (3 from the bank you haven't solved + 2 generated), checked automatically.
+let ps = null;
+function todaysPuzzles() {
+  const k = dayKey();
+  S.puzzleGen ||= {};
+  if (S.puzzleGen.day !== k) S.puzzleGen = { day: k, items: [genPuzzle(), genPuzzle()] };
+  const solved = Object.entries(S.puzzles).filter(([, v]) => v.solved).map(([id]) => id);
+  return [...puzzleSet(k, solved), ...S.puzzleGen.items];
+}
 function vPuzzles() {
-  return PUZZLES.map((p) => { const st = S.puzzles[p.id] || {}; return `<section class="card puzzle ${st.solved ? "done" : ""}"><p><b>${st.solved ? "✅ " : ""}${esc(p.q)}</b></p>
-    ${st.revealed ? `<p class="task">Answer: <b>${esc(p.a)}</b></p><p class="muted">${esc(p.why)}</p>` : `<div class="inline"><input placeholder="Your answer" id="pa-${p.id}"><button data-act="puz-reveal" data-id="${p.id}">Reveal</button></div>`}
-    ${st.revealed && !st.graded ? `<div class="row-btns"><button class="good" data-act="puz-grade" data-id="${p.id}" data-ok="1">I got it</button><button class="again" data-act="puz-grade" data-id="${p.id}" data-ok="0">I missed it</button></div>` : ""}
-    ${st.guess ? `<p class="muted">Your answer: ${esc(st.guess)}</p>` : ""}</section>`; }).join("");
+  const list = todaysPuzzles();
+  if (!ps || ps.day !== dayKey()) ps = { day: dayKey(), i: null };
+  const solvedBank = PUZZLE_BANK.filter((p) => S.puzzles[p.id]?.solved).length;
+  if (ps.i === null || ps.i >= list.length) return `<section class="card"><h2>Today's set</h2><p class="muted">A new set every day: 3 classics from a bank of ${PUZZLE_BANK.length} (you've solved ${solvedBank}) plus 2 generated ones. Answers are checked automatically; after each one you can ask the tutor about any step.</p>
+    ${list.map((p, i) => { const st = S.puzzles[p.id] || {}; return `<div class="cardrow" data-act="puz-open" data-i="${i}"><span>${st.solved ? "✅" : st.tried ? "❌" : "⬜"}</span><div class="grow">${esc(p.q.length > 110 ? p.q.slice(0, 110) + "…" : p.q)}</div><span class="muted">›</span></div>`; }).join("")}
+    <div class="row-btns"><button data-act="puz-open" data-i="${list.findIndex((p) => !S.puzzles[p.id]?.tried) < 0 ? 0 : list.findIndex((p) => !S.puzzles[p.id]?.tried)}" class="primary">Start</button><button data-act="puz-more">+ 3 more generated</button></div></section>`;
+  const p = list[ps.i];
+  if (!cur || cur.mode !== "puzzle" || cur.p.id !== p.id) cur = { mode: "puzzle", kp: { id: "puzzle", title: "Brainteaser" }, u: null, p, answered: null, hint: false,
+    onAnswer: (ok) => { const st = (S.puzzles[p.id] ||= {}); const first = !st.tried; st.tried = true; if (ok && !st.solved) { st.solved = dayKey(); addXP(first ? 15 : 8, "Puzzle solved"); } save(); } };
+  return `<section class="card"><div class="course-head"><b class="grow">Puzzle ${ps.i + 1} of ${list.length}</b><a data-act="puz-list">All of today's</a></div>${problemHTML()}</section>`;
 }
 let mk = { i: null, res: null };
 function vMarkets() {
   if (mk.i === null) mk.i = ri(0, MARKETS.length - 1);
   const m = MARKETS[mk.i], recent = S.markets.slice(-10).reverse();
-  return `<section class="card"><p class="muted">Quote a bid and ask so you're 90% sure the true value is inside. Tighter scores more; a miss scores zero.</p><h2>${esc(m.q)}</h2>
-    ${mk.res ? `<p class="task">True value: <b>${m.a.toLocaleString()}</b> · your market ${mk.res.bid.toLocaleString()} – ${mk.res.ask.toLocaleString()} · <b>${mk.res.score} pts</b></p><button class="primary" data-act="mk-next">Next market</button>` : `
+  const hits = S.markets.filter((x) => x.score > 0).length, n = S.markets.length, rate = n ? Math.round((hits / n) * 100) : null;
+  const verdict = (r) => { if (!r) return ""; const m2 = MARKETS[mk.i], inside = m2.a >= r.bid && m2.a <= r.ask, ratio = r.ask / Math.max(r.bid, 1e-9);
+    return inside ? `✅ The true value is inside your market. Your ask was ${ratio.toFixed(2)}× your bid: ${ratio < 1.3 ? "a tight, useful market" : ratio < 2.5 ? "reasonable; tighten it if you were confident" : "very wide: safe, but a market this wide tells a trader little"}.`
+      : m2.a > r.ask ? `❌ The true value is above your ask. A trader who knew it would buy from you at ${r.ask.toLocaleString()} and you'd lose ${(m2.a - r.ask).toLocaleString()} per unit.` : `❌ The true value is below your bid. A trader who knew it would sell to you at ${r.bid.toLocaleString()} and you'd lose ${(r.bid - m2.a).toLocaleString()} per unit.`; };
+  return `<section class="card"><details ${n < 3 ? "open" : ""}><summary><b>How this game works</b></summary>
+      <p>In trading interviews you're often asked to <b>“make a market”</b> on a number nobody expects you to know exactly, like the height of Everest. You answer with two prices:</p>
+      <p>• your <b>bid</b>: the price at which you'd buy;<br>• your <b>ask</b>: the price at which you'd sell (higher than the bid).</p>
+      <p>Imagine the other side knows the true value. If the truth is above your ask, they buy from you too cheaply; if it's below your bid, they sell to you too dearly. Either way you lose. If it's between, you're safe.</p>
+      <p>So the skill is <b>calibration</b>: wide enough to contain the truth, narrow enough to be useful. A market of 1 to 1,000,000 is never wrong but worthless.</p>
+      <p><b>Scoring:</b> a miss scores 0. A hit scores 100 − 60·log₁₀(ask ÷ bid): about 95 for ±10%, 82 if the ask is 2× the bid, 40 at 10×. Aim to contain the truth about <b>90%</b> of the time: much higher means you're too wide, much lower means you're overconfident.</p>
+      <p class="muted">Tip: reason out loud first. Everest? Taller than Mont Blanc (~4,800 m), planes cruise around 10,000 m, so maybe 8,000–9,500.</p></details></section>
+    <section class="card"><h2>${esc(m.q)}</h2>
+    ${mk.res ? `<p class="task">True value: <b>${m.a.toLocaleString()}</b> · your market ${mk.res.bid.toLocaleString()} – ${mk.res.ask.toLocaleString()} · <b>${mk.res.score} pts</b></p><p>${verdict(mk.res)}</p><button class="primary" data-act="mk-next">Next market</button>` : `
     <div class="inline"><input type="number" id="mbid" placeholder="Bid" inputmode="decimal"><input type="number" id="mask" placeholder="Ask" inputmode="decimal"><button class="primary" data-act="mk-quote">Quote</button></div>`}</section>
   <section class="card"><h2>Recent</h2>${recent.length ? recent.map((x) => `<div class="cardrow"><div class="grow">${esc(x.q)}</div><b>${x.score}</b></div>`).join("") : `<p class="muted">No markets yet.</p>`}
-  ${S.markets.length ? `<p class="muted">Hit rate: ${Math.round((S.markets.filter((x) => x.score > 0).length / S.markets.length) * 100)}% (aim for about 90%)</p>` : ""}</section>`;
+  ${n ? `<p class="muted">Calibration: the truth was inside ${hits} of your ${n} markets (${rate}%). ${n < 10 ? "Play at least 10 to judge it." : rate > 95 ? "You're too wide: tighten up." : rate < 80 ? "You're overconfident: widen your markets." : "Well calibrated."}</p>` : ""}</section>`;
 }
 
 /* ============================== Tutor (local LLM via WebLLM) ============================== */
@@ -820,6 +900,7 @@ function systemPrompt() {
     "4. Check understanding by asking them to explain in their own words or apply the idea to a new example.",
     "5. If they ask a direct factual question (a definition, a formula), answer it plainly.",
     "6. If you're not sure, say so. Never invent facts or sources.",
+    "8. When you use a formula or rule, say why it applies here: which assumption or structure of the problem makes it valid. Expect follow-up questions like 'why that equation?' and answer them from first principles.",
     "7. When the learner got a problem wrong, find the specific misconception behind their answer, explain it, then give one similar problem (new numbers) and wait for their attempt.",
     `Mode: ${MODES[tutor.mode][1]}`,
     tutor.ctx ? `Material the learner provided:\n"""${tutor.ctx.slice(0, 6000)}"""` : "",
@@ -1174,14 +1255,16 @@ document.addEventListener("click", async (e) => {
       else if (m === "practice") { pr.n++; cur = null; }
       else if (m === "boss") { bs.i++; cur = null; }
       else if (m === "review") { rv.i++; rv.done++; cur = null; }
+      else if (m === "puzzle") { ps.i++; cur = null; if (ps.i >= todaysPuzzles().length) ps.i = null; }
+      else if (m === "game") { gs.n++; cur = null; }
       render(); break;
     }
     case "ask-kp": {
-      const kp = cur?.kp || lessonFor(unitById(ls?.uid))?.[ls?.k], u = cur?.u || unitById(ls?.uid);
+      const kp = cur?.kp || lessonFor(unitById(ls?.uid))?.[ls?.k], u = cur?.u || (cur ? null : unitById(ls?.uid));
       if (!kp) break;
-      const tmp = document.createElement("div"); tmp.innerHTML = kp.teach;
-      tutor.unit = u.id; tutor.mode = "socratic"; tutor.returnTo = location.hash;
-      tutor.ctx = `Lesson: ${kp.title}\n${tmp.textContent}` + (cur?.p ? `\n\nProblem: ${cur.p.q}\nCorrect answer: ${shown(cur.p)}\nWorked solution: ${cur.p.sol}` + (cur.answered && !cur.answered.ok ? `\nBen answered: ${cur.p.type === "mc" ? cur.p.choices[cur.answered.given] ?? "(didn't know)" : cur.answered.given || "(didn't know)"}` : "") : "");
+      const tmp = document.createElement("div"); tmp.innerHTML = kp.teach || "";
+      tutor.unit = u?.id || null; tutor.mode = "socratic"; tutor.returnTo = location.hash;
+      tutor.ctx = (kp.teach ? `Lesson: ${kp.title}\n${tmp.textContent}` : `Activity: ${kp.title}`) + (cur?.p ? `\n\nProblem: ${cur.p.q}\nCorrect answer: ${shown(cur.p)}\nWorked solution: ${cur.p.sol}` + (cur.answered && !cur.answered.ok ? `\nBen answered: ${cur.p.type === "mc" ? cur.p.choices[cur.answered.given] ?? "(didn't know)" : cur.answered.given || "(didn't know)"}` : "") : "");
       tutor.draft = cur?.answered && !cur.answered.ok ? "I got this wrong. What am I misunderstanding?" : "Can you explain this another way?";
       go("tutor"); break;
     }
@@ -1204,10 +1287,7 @@ document.addEventListener("click", async (e) => {
     case "cloud-save": { const raw = $("#cloudkey").value.trim(); const k = raw === "••••••••" ? cloudKey : raw; cloudKey = k || null; await kvPut("cloudKey", cloudKey); S.settings.cloudModel = $("#cloudmodel").value.trim() || "claude-sonnet-5-5"; save(); toast(k ? "Claude tutor on" : "Claude tutor off"); render(); break; }
     case "chest": { const d = today(); if (!d.chest) { d.chest = true; addXP(50, "Daily chest"); celebrate("🎁 +50 XP", "All quests complete."); render(); } break; }
     case "mode": S.settings.mode = a.dataset.mode; save(); render(); break;
-    case "timer": startTimer(uid, Number(a.dataset.min)); break;
-    case "block-start": startTimer(uid, Number(a.dataset.min), a.dataset.course); cur = null; go(stepRoute(uid)); break;
-    case "block-done": completeBlock(a.dataset.course); save(); render(); break;
-    case "stop-timer": stopTimer(); break;
+    case "block-start": cur = null; go(stepRoute(uid)); break;
     case "step": {
       const st = unitState(uid), s = STEPS.find((x) => x.id === a.dataset.step);
       if (st.steps[s.id]) delete st.steps[s.id];
@@ -1261,8 +1341,12 @@ document.addEventListener("click", async (e) => {
     case "rm-file": { const fid = S.files[a.dataset.key]; delete S.files[a.dataset.key]; if (fid && !Object.values(S.files).includes(fid)) await fileDel(fid); save(); render(); break; }
     case "drill-start": drill.running = true; drill.score = 0; drill.end = Date.now() + 120000; newProblem(); clearInterval(drill.t); drill.t = setInterval(drillTick, 250); render(); break;
     case "zlog": { const v = Number($("#zman").value); if (!(v > 0)) break; const pb = v > bestZ(); S.zetamac.push({ date: dayKey(), score: v, src: "manual" }); addXP(10 + (pb ? 15 : 0), pb ? `New best: ${v}!` : "Score logged"); render(); break; }
-    case "puz-reveal": { const p = (S.puzzles[a.dataset.id] ||= {}); p.revealed = true; p.guess = $(`#pa-${a.dataset.id}`)?.value || ""; save(); render(); break; }
-    case "puz-grade": { const p = S.puzzles[a.dataset.id]; p.graded = true; p.solved = a.dataset.ok === "1"; addXP(p.solved ? 15 : 5, p.solved ? "Puzzle solved" : "Puzzle attempted"); render(); break; }
+    case "puz-open": ps.i = Number(a.dataset.i); cur = null; render(); break;
+    case "puz-list": ps.i = null; cur = null; render(); break;
+    case "puz-more": todaysPuzzles(); S.puzzleGen.items.push(genPuzzle(), genPuzzle(), genPuzzle()); save(); render(); break;
+    case "g-again": gs = null; cur = null; render(); break;
+    case "bz-start": bz.running = true; bz.score = 0; bz.misses = []; bz.end = Date.now() + 60000; bz.p = genBlitz(); clearInterval(bz.t); bz.t = setInterval(blitzTick, 250); render(); break;
+    case "bz-check": { const v = $("#bans")?.value || ""; if (!v.trim()) break; if (checkAnswer(bz.p, v)) bz.score++; else bz.misses.push({ q: bz.p.q, given: v, sol: bz.p.sol }); bz.p = genBlitz(); render(); setTimeout(() => $("#bans")?.focus(), 20); break; }
     case "mk-quote": {
       const bid = Number($("#mbid").value), ask = Number($("#mask").value);
       if (!(ask > bid && bid >= 0)) { toast("Ask must be above bid"); break; }
@@ -1346,6 +1430,7 @@ document.addEventListener("change", async (e) => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.target.id === "tin" && e.key === "Enter" && !e.shiftKey) { e.preventDefault(); tutorSend(); }
+  if (e.target.id === "bans" && e.key === "Enter") { e.preventDefault(); $('[data-act="bz-check"]')?.click(); }
   if (e.target.id === "pans" && e.key === "Enter") { e.preventDefault(); $('[data-act="pcheck"]')?.click(); }
   if (e.key === "Enter" && cur?.answered && !e.target.closest("textarea,input")) { e.preventDefault(); $('[data-act="pnext"]')?.click(); }
   if (route().view === "review" && !e.target.closest("input,textarea")) {
@@ -1358,6 +1443,7 @@ document.addEventListener("keydown", (e) => {
 async function boot() {
   try { const saved = await kvGet("state"); if (saved?.version) S = migrate(saved); } catch (e) { console.warn("Storage unavailable", e); }
   try { syncToken = (await kvGet("syncToken")) || null; cloudKey = (await kvGet("cloudKey")) || null; } catch {}
+  S.timer = null;
   invalidate(); render(); renderTimer();
   if (syncToken) syncNow();
   if ("serviceWorker" in navigator && location.protocol !== "file:") navigator.serviceWorker.register("./sw.js").catch((e) => console.warn("SW failed", e));

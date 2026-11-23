@@ -205,3 +205,5 @@ details summary { cursor: pointer; }
 .pill.bad { color: #e5484d; }
 ul.left { text-align: left; display: inline-block; }
 .cardrow[data-act] { cursor: pointer; }
+.tabs { flex-wrap: wrap; }
+#timerbar span { font-size: 14px; }
