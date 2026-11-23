@@ -1,6 +1,8 @@
 import { BUILTIN, STEPS, SEED_CARDS, PUZZLES, MARKETS, TITLES } from "./data.js";
 import { LIBRARY, PACK_PROMPT } from "./library.js";
 import { METHOD } from "./method.js";
+import { LESSONS, LESSON_PROMPT } from "./lessons.js";
+import { GEN, checkAnswer } from "./gens.js";
 
 /* ============================== Storage ============================== */
 let dbp = null;
@@ -47,7 +49,7 @@ const DEFAULT_STATE = () => ({
   enabled: ["ling", "prob"],
   customCourses: [],
   coursePrefs: {},
-  sync: {}, updatedAt: 0,
+  sync: {}, updatedAt: 0, kps: {}, mistakes: [], genLessons: {},
   settings: { model: "Qwen3.5-2B-q4f16_1-MLC", mode: "break", minutes: { term: 120, break: 180 }, maxSubjects: 4 },
 });
 let S = DEFAULT_STATE();
@@ -147,6 +149,10 @@ function mergeStates(a, b) {
   o.streak = (sb.last || "") > (sa.last || "") ? { ...sb } : (sa.last || "") > (sb.last || "") ? { ...sa } : { ...sa, count: mx(sa.count, sb.count) };
   o.streak.restWeeks = [...new Set([...(sa.restWeeks || []), ...(sb.restWeeks || [])])];
   o.xp = Math.max(a.xp || 0, b.xp || 0, Object.values(o.days).reduce((t, d) => t + (d.xp || 0), 0));
+  o.kps = { ...a.kps };
+  for (const [id, k] of Object.entries(b.kps || {})) { const l = o.kps[id]; if (!l) { o.kps[id] = k; continue; } const later = (k.last || 0) > (l.last || 0) ? k : l; o.kps[id] = { ...l, ...k, s: later.s, d: later.d, due: later.due, last: later.last, reps: mx(l.reps, k.reps), errors: mx(l.errors, k.errors), correct: mx(l.correct, k.correct), learned: l.learned && k.learned ? (l.learned < k.learned ? l.learned : k.learned) : l.learned || k.learned, testedOut: l.testedOut || k.testedOut, seen: { ...(k.seen || {}), ...(l.seen || {}) } }; }
+  o.mistakes = uniq(a.mistakes, b.mistakes).sort((x, y) => (x.date < y.date ? 1 : -1)).slice(0, 300);
+  o.genLessons = { ...(b.genLessons || {}), ...(a.genLessons || {}) };
   o.files = a.files; o.timer = a.timer; o.sync = a.sync;
   return o;
 }
@@ -298,7 +304,7 @@ function recentMinutes(cid) { let m = 0; for (let i = 1; i <= 7; i++) m += S.day
 function planToday() {
   const d = today();
   const budget = S.settings.minutes[S.settings.mode] || 120;
-  const due = dueCards().length;
+  const due = dueCards().length + dueKps().length;
   const warm = 5;
   const rev = Math.min(25, Math.max(due ? 5 : 0, Math.round(due * 0.4)));
   let remaining = Math.max(30, budget - warm - rev);
@@ -317,7 +323,7 @@ function planToday() {
   const doy = Math.floor((parseDay(dayKey()) - new Date(parseDay(dayKey()).getFullYear(), 0, 0)) / 864e5);
   if (blocks.length) blocks = [...blocks.slice(doy % blocks.length), ...blocks.slice(0, doy % blocks.length)];
   blocks.forEach((b) => (b.done = !!d.blocks[b.course.id]));
-  return { budget, warm, rev, due, blocks, warmDone: S.zetamac.some((z) => z.date === dayKey()), revDone: due === 0 && (d.reviews > 0 || !allCards().some((c) => c.active)) };
+  return { budget, warm, rev, due, blocks, warmDone: S.zetamac.some((z) => z.date === dayKey()), revDone: due === 0 };
 }
 
 /* ============================== UI primitives ============================== */
@@ -370,22 +376,23 @@ const route = () => { const h = location.hash.replace(/^#\/?/, "") || "today"; c
 const go = (path) => (location.hash = "#/" + path);
 window.addEventListener("hashchange", () => render());
 function renderHeader() {
-  const l = level(S.xp), lo = levelXp(l), hi = levelXp(l + 1), due = dueCards().length;
+  const l = level(S.xp), lo = levelXp(l), hi = levelXp(l + 1), due = dueCards().length + dueKps().length;
   $("#header").innerHTML = `<div class="brand">StudyQuest</div><div class="lvl"><b>Lv ${l}</b> <span class="muted">${title(l)}</span><div class="bar"><i style="width:${Math.round(((S.xp - lo) / (hi - lo)) * 100)}%"></i></div></div>
     <div class="chips"><span class="chip">🔥 ${S.streak.count}</span><span class="chip">✨ ${S.xp}</span><span class="chip ${due ? "warn" : ""}">🧠 ${due}</span></div>`;
   const { view } = route();
-  $("#nav").innerHTML = NAV.map(([id, ic, n]) => `<a href="#/${id}" class="${view === id || (id === "map" && view === "unit") || (id === "more" && MORE.includes(view)) ? "on" : ""}"><span>${ic}</span>${n}</a>`).join("");
+  $("#nav").innerHTML = NAV.map(([id, ic, n]) => `<a href="#/${id}" class="${view === id || (id === "map" && ["unit", "lesson", "diag", "practice", "boss"].includes(view)) || (id === "more" && MORE.includes(view)) ? "on" : ""}"><span>${ic}</span>${n}</a>`).join("");
 }
 function render() {
   renderHeader();
   const { view, arg } = route();
-  const views = { today: vToday, map: vMap, unit: vUnit, review: vReview, arena: vArena, tutor: vTutor, more: vMore, library: vLibrary, goals: vGoals, method: vMethod, settings: vSettings, courses: vCourses, edit: vEdit };
+  const views = { today: vToday, map: vMap, unit: vUnit, review: vReview, arena: vArena, tutor: vTutor, more: vMore, library: vLibrary, goals: vGoals, method: vMethod, settings: vSettings, courses: vCourses, edit: vEdit, lesson: vLesson, diag: vDiag, practice: vPractice, boss: vBoss };
   const v = $("#view");
   v.innerHTML = (views[view] || vToday)(arg);
   v.scrollTop = 0;
   if (view === "tutor") { const c = $("#tchat"); if (c) c.scrollTop = c.scrollHeight; }
   if (view === "library") updateQuota();
   if (view === "arena" && arg === "drill" && drill.running) setTimeout(() => $("#dans")?.focus(), 30);
+  if (cur && !cur.answered && $("#pans")) setTimeout(() => $("#pans")?.focus(), 30);
 }
 
 /* ============================== Today: the mixed daily session ============================== */
@@ -405,7 +412,7 @@ function vToday() {
     <div class="block ${b.done ? "done" : ""}" style="--c:${b.course.color}">
       <div class="bnum">${i + 3}</div>
       <div class="dot" style="background:${b.course.color}">${b.course.emoji}</div>
-      <div class="grow" data-go="unit/${b.unit.id}"><b>${esc(b.course.name)} · ${b.minutes} min</b>
+      <div class="grow" data-go="${stepRoute(b.unit.id)}"><b>${esc(b.course.name)} · ${b.minutes} min</b>
         <div class="muted">${esc(b.unit.title)} · ${b.step ? b.step.icon + " " + b.step.name : "Review & apply"}${b.unit.target < dayKey() ? ' · <span class="late">behind</span>' : ""}</div></div>
       ${b.done ? `<span class="pill ok">done</span>` : `<button class="primary" data-act="block-start" data-course="${b.course.id}" data-unit="${b.unit.id}" data-min="${b.minutes}">Start</button><button data-act="block-done" data-course="${b.course.id}">✓</button>`}
     </div>`;
@@ -417,7 +424,7 @@ function vToday() {
     <div class="mini wide2"><i style="width:${(done / total) * 100}%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></i></div>
     <p class="muted">A bit of every subject, in a different order each day. Do the blocks in order; take 5 minutes between them.</p>
     <div class="block ${p.warmDone ? "done" : ""}"><div class="bnum">1</div><div class="dot" style="background:#f5a524">⚡</div><div class="grow"><b>Warm-up · ${p.warm} min</b><div class="muted">One 2-minute mental-math run</div></div>${p.warmDone ? `<span class="pill ok">done</span>` : `<button class="primary" data-go="arena/drill">Go</button>`}</div>
-    <div class="block ${p.revDone ? "done" : ""}"><div class="bnum">2</div><div class="dot" style="background:#7c5cff">🧠</div><div class="grow"><b>Reviews · ~${p.rev} min</b><div class="muted">${p.due} cards due, mixed across subjects</div></div>${p.revDone ? `<span class="pill ok">done</span>` : `<button class="primary" data-go="review">Go</button>`}</div>
+    <div class="block ${p.revDone ? "done" : ""}"><div class="bnum">2</div><div class="dot" style="background:#7c5cff">🧠</div><div class="grow"><b>Reviews · ~${p.rev} min</b><div class="muted">${p.due} due (problems and cards), mixed across subjects</div></div>${p.revDone ? `<span class="pill ok">done</span>` : `<button class="primary" data-go="review">Go</button>`}</div>
     ${p.blocks.map(blockRow).join("") || `<p class="muted">No active subjects. Turn some on in <a href="#/courses">Courses</a>.</p>`}
   </section>
   <section class="card"><h2>Daily quests</h2>
@@ -447,21 +454,31 @@ function vUnit(id) {
   if (!u) return `<section class="card"><p>This unit isn't in an active course. <a href="#/courses">Manage courses</a>.</p></section>`;
   const st = unitState(id), cards = cardsFor(id), str = conceptStrength(id);
   const notesFile = u.resources.map((r, i) => ({ r, k: rkey(u, r, i) })).find((x) => x.r.type !== "video" && S.files[x.k]);
+  const L = lessonFor(u), nL = L ? L.filter((kp) => S.kps[kp.id]?.learned).length : 0;
+  const lessonStep = (sid) => !L ? null : {
+    pretest: `<div class="row-btns"><button class="primary" data-act="dgo" data-unit="${id}">Take the quick check</button><button data-act="dskip" data-unit="${id}">It's all new: skip</button></div>`,
+    learn: `<p class="muted">${nL}/${L.length} concepts learned. Explanation → worked example → you solve two in a row.</p><button class="primary" data-act="lstart" data-unit="${id}">${nL ? "Continue the lesson" : "Start the lesson"}</button>`,
+    practice: `<p class="muted">8 generated problems, weighted toward your mistakes. 75% completes the step.</p><button class="primary" data-act="pr-go" data-unit="${id}">Practice</button>`,
+    check: `<p class="muted">One fresh problem per concept, no hints. 80% masters the unit.${st.score != null ? ` Best so far: ${st.score}%.` : ""}</p><button class="primary" data-act="boss-go" data-unit="${id}">Boss fight</button>`,
+  }[sid];
+  const noLesson = `<div class="nolesson"><p><b>No lessons written for this unit yet.</b></p>
+    ${writing === id ? `<p class="muted">🎩 Writing lessons…</p>` : `<div class="row-btns">${cloudReady() ? `<button class="primary" data-act="write-lessons" data-unit="${id}">🎩 Write lessons with Claude${notesFile ? " from your notes" : ""}</button>` : `<a class="btn" href="#/settings">Add a Claude API key to write them here</a>`}<button data-act="paste-lessons" data-unit="${id}">Paste lessons</button><button data-act="copy-lprompt" data-unit="${id}">Copy prompt for Claude chat</button></div>`}</div>`;
   return `
   <section class="hero"><a class="back" href="#/map">‹ Map</a><h1>${esc(u.course.emoji)} ${esc(u.title)}</h1>
     <p class="muted">${esc(u.course.name)} · target ${fmtDate(u.target)}${st.minutes ? ` · ${st.minutes} min logged` : ""}${st.mastered ? " · 👑 mastered " + fmtDate(st.mastered) : ""}</p>
     <div class="chips wrap">${u.concepts.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>${str !== null ? `<p class="muted">Memory strength: <b>${str}%</b></p>` : ""}</section>
   <section class="card row-btns"><button data-act="timer" data-min="25" data-unit="${id}">⏱️ Focus 25</button><button data-act="timer" data-min="50" data-unit="${id}">⏱️ Focus 50</button><button data-act="ask-tutor" data-unit="${id}">🤖 Ask tutor</button></section>
+  ${L ? `<section class="card"><h2>Concepts</h2>${L.map((kp, i) => { const ks = S.kps[kp.id] || {}, er = recentErrors(kp.id); return `<div class="cardrow" data-act="lstart" data-unit="${id}" data-k="${i}"><span>${ks.learned ? "✅" : ks.testedOut ? "⏭️" : "⬜"}</span><div class="grow"><b>${esc(kp.title)}</b>${er ? `<div class="muted">missed ${er}× in the last two weeks</div>` : ""}</div><span class="muted">›</span></div>`; }).join("")}</section>` : ""}
   <section class="card"><h2>Mastery loop</h2>
     ${STEPS.map((s, i) => { const done = st.steps[s.id], isNext = !done && nextStep(id)?.id === s.id; return `
       <details class="step ${done ? "done" : ""}" ${isNext ? "open" : ""}><summary><span class="sicon">${done ? "✅" : s.icon}</span><b>${i + 1}. ${s.name}</b><span class="muted">+${s.xp} XP</span></summary>
-        <p>${esc(s.how)}</p>
+        ${lessonStep(s.id) ? "" : `<p>${esc(s.how)}</p>`}${lessonStep(s.id) || ""}${!L && s.id === "learn" ? noLesson : ""}
         ${s.id === "apply" && u.apply ? `<p class="task">🛠️ ${esc(u.apply)}</p>` : ""}
-        ${s.id === "pretest" ? (cards.length ? `<button data-act="pretest" data-unit="${id}">Start pre-test on ${cards.length} cards</button>` : `<p class="muted">No cards yet: try 3 problems from the problem set cold instead, then mark this done.</p><button class="primary" data-act="step" data-unit="${id}" data-step="pretest">Mark done</button>`) : ""}
+        ${s.id === "pretest" && !L ? (cards.length ? `<button data-act="pretest" data-unit="${id}">Start pre-test on ${cards.length} cards</button>` : `<p class="muted">No cards yet: try 3 problems from the problem set cold instead, then mark this done.</p><button class="primary" data-act="step" data-unit="${id}" data-step="pretest">Mark done</button>`) : ""}
         ${s.id === "tutor" ? `<button data-act="ask-tutor" data-unit="${id}" data-mode="quiz">Open tutor: Quiz me</button>` : ""}
         ${s.id === "cards" ? `<button data-act="gen-cards" data-unit="${id}">🃏 Have the tutor draft cards${notesFile ? " from your notes" : ""}</button>` : ""}
-        ${s.id === "check" ? `<div class="inline"><input type="number" min="0" max="100" placeholder="Score %" id="score-${id}" inputmode="numeric" value="${st.score ?? ""}"><button data-act="boss" data-unit="${id}">Submit score</button></div>` : ""}
-        ${s.id !== "pretest" && s.id !== "check" ? `<button class="${done ? "" : "primary"}" data-act="step" data-unit="${id}" data-step="${s.id}">${done ? "Undo" : "Mark done"}</button>` : ""}
+        ${s.id === "check" && !L ? `<div class="inline"><input type="number" min="0" max="100" placeholder="Score %" id="score-${id}" inputmode="numeric" value="${st.score ?? ""}"><button data-act="boss" data-unit="${id}">Submit score</button></div>` : ""}
+        ${!["pretest", "check"].includes(s.id) && !(L && ["learn", "practice"].includes(s.id)) ? `<button class="${done ? "" : "primary"}" data-act="step" data-unit="${id}" data-step="${s.id}">${done ? "Undo" : "Mark done"}</button>` : ""}
         ${done ? `<span class="muted"> done ${fmtDate(done)}</span>` : ""}</details>`; }).join("")}</section>
   <section class="card"><h2>Materials</h2>
     ${u.resources.map((r, i) => { const k = rkey(u, r, i), has = S.files[k]; return `
@@ -474,13 +491,240 @@ function vUnit(id) {
     <button data-act="add-card" data-unit="${id}">+ Add card</button></section>`;
 }
 
+/* ============================== Learning engine: lessons, adaptive check, practice, boss ============================== */
+// Lessons come from lessons.js (built in), a course pack (unit.lesson), or ones written later (S.genLessons).
+const lessonFor = (u) => (u && (u.lesson || S.genLessons?.[u.id] || LESSONS[u.id])) || null;
+const kpState = (id) => (S.kps[id] ||= { errors: 0, correct: 0, seen: {} });
+const safeHTML = (s) => esc(s).replace(/&lt;(\/?)(b|i|sup|sub|br)\s*\/?&gt;/g, "<$1$2>");
+function asFrac(x) { if (Number.isInteger(x)) return x.toLocaleString(); for (let q = 2; q <= 5000; q++) { const n = Math.round(x * q); if (Math.abs(n / q - x) < 1e-9) return `${n}/${q} (≈ ${Math.round(x * 10000) / 10000})`; } return String(Math.round(x * 10000) / 10000); }
+const shown = (p) => (p.type === "mc" ? p.choices[p.a] : p.type === "text" ? p.a[0] : asFrac(p.a));
+function makeProblem(kp, avoidQ) {
+  if (kp.gen && GEN[kp.gen]) { let p; for (let t = 0; t < 4; t++) { p = GEN[kp.gen](); if (p.q !== avoidQ) break; } return p; }
+  const P = kp.problems || [], st = kpState(kp.id);
+  if (!P.length) return null;
+  const idx = P.map((_, i) => i).filter((i) => P[i].q !== avoidQ);
+  const fresh = idx.filter((i) => st.seen[i] !== true); // never answered correctly
+  const pool = fresh.length ? fresh : idx.length ? idx : [0];
+  const i = pool[Math.floor(Math.random() * pool.length)];
+  return { ...P[i], idx: i };
+}
+function recordAnswer(kp, u, p, ok, given, review) {
+  const st = kpState(kp.id);
+  if (ok) st.correct++; else st.errors++;
+  if (p.idx !== undefined) st.seen[p.idx] = ok;
+  if (!ok) { S.mistakes.unshift({ kp: kp.id, unit: u.id, q: p.q, given: p.type === "mc" ? p.choices[given] ?? "(skipped)" : String(given || "(skipped)"), a: shown(p), date: dayKey() }); S.mistakes.length = Math.min(S.mistakes.length, 300); }
+  if (review && (st.learned || st.testedOut)) { const n = schedule(st, ok ? 3 : 1); Object.assign(st, { s: n.s, d: n.d, due: n.due, last: n.last, reps: n.reps }); }
+  save();
+}
+function completeStep(uid, sid) {
+  const st = unitState(uid);
+  if (st.steps[sid]) return;
+  st.steps[sid] = dayKey(); today().steps++;
+  const s = STEPS.find((x) => x.id === sid); addXP(s.xp, s.name);
+  if (sid === "cards") activateUnitCards(uid);
+}
+function learnedKps(units) { return units.flatMap((u) => (lessonFor(u) || []).map((kp) => ({ kp, u }))).filter((x) => S.kps[x.kp.id]?.learned || S.kps[x.kp.id]?.testedOut); }
+function recentErrors(kpid) { const cut = addDays(dayKey(), -14); return S.mistakes.filter((m) => m.kp === kpid && m.date >= cut).length; }
+function dueKps() { const now = Date.now(); return learnedKps(allUnits()).filter((x) => S.kps[x.kp.id].due && S.kps[x.kp.id].due <= now); }
+function stepRoute(uid) {
+  const u = unitById(uid); if (!u || !lessonFor(u)) return "unit/" + uid;
+  const n = nextStep(uid)?.id;
+  return { pretest: "diag/", learn: "lesson/", practice: "practice/", check: "boss/" }[n] ? { pretest: "diag/", learn: "lesson/", practice: "practice/", check: "boss/" }[n] + uid : "unit/" + uid;
+}
+
+// ---- One shared problem widget ----
+let cur = null; // { p, kp, u, answered: null | {ok, given}, hint, onDone }
+function problemHTML(opts = {}) {
+  const p = cur.p, a = cur.answered;
+  let input;
+  if (p.type === "mc") input = `<div class="choices">${p.choices.map((c, i) => `<button class="choice ${a ? (i === p.a ? "right" : a.given === i ? "wrong" : "") : ""}" data-act="pchoice" data-i="${i}" ${a ? "disabled" : ""}>${esc(c)}</button>`).join("")}</div>`;
+  else input = `<div class="inline"><input id="pans" autocomplete="off" autocapitalize="off" spellcheck="false" ${p.type === "num" ? 'inputmode="text" placeholder="Answer: a number, fraction, or expression like C(10,3)/2^10"' : 'placeholder="Your answer"'} value="${a ? esc(a.given) : ""}" ${a ? "disabled" : ""}>${a ? "" : `<button class="primary" data-act="pcheck">Check</button>`}</div>`;
+  return `<div class="problem-card"><p class="pq">${esc(p.q)}</p>${input}
+    ${!a && opts.idk ? `<button data-act="pidk">I haven't learned this</button>` : ""}
+    ${!a && p.hint && !opts.noHint ? (cur.hint ? `<p class="hint">💡 ${esc(p.hint)}</p>` : `<button data-act="phint">Hint</button>`) : ""}
+    ${a ? `<div class="feedback ${a.ok ? "ok" : "bad"}"><b>${a.ok ? "✅ Correct." : a.skip ? "Here's how it works:" : `❌ Not quite. The answer is ${esc(shown(p))}.`}</b><p>${esc(p.sol)}</p></div>
+      <div class="row-btns"><button class="primary" data-act="pnext">Continue</button>${!a.ok && !opts.noTutor ? `<button data-act="ask-kp">🎩 Ask the tutor why</button>` : ""}</div>` : ""}</div>`;
+}
+function answer(given, skip) {
+  if (!cur || cur.answered) return;
+  const ok = !skip && checkAnswer(cur.p, given);
+  cur.answered = { ok, given, skip };
+  cur.onAnswer?.(ok, given);
+  render();
+}
+
+// ---- Lesson player ----
+let ls = null;
+function startLesson(uid, k) {
+  const L = lessonFor(unitById(uid));
+  const first = L.findIndex((kp) => !S.kps[kp.id]?.learned);
+  ls = { uid, k: k ?? (first < 0 ? 0 : first), phase: "teach", ex: 1, streak: 0, errs: 0 };
+  cur = null;
+}
+function vLesson(uid) {
+  const u = unitById(uid), L = lessonFor(u);
+  if (!u || !L) return vUnit(uid);
+  if (!ls || ls.uid !== uid) startLesson(uid);
+  const kp = L[ls.k], st = kpState(kp.id), need = st.testedOut || st.learned ? 1 : 2;
+  const vids = u.resources.filter((r) => r.type === "video" && /youtu/.test(r.url || ""));
+  const dots = L.map((x, i) => `<a class="kdot ${S.kps[x.id]?.learned ? "done" : S.kps[x.id]?.testedOut ? "tested" : ""} ${i === ls.k ? "on" : ""}" data-act="lgoto" data-k="${i}" title="${esc(x.title)}"></a>`).join("");
+  let body = "";
+  if (ls.phase === "teach") body = `<section class="card lesson"><h2>${esc(kp.title)}</h2><div class="teach">${safeHTML(kp.teach)}</div>
+      ${ls.k === 0 && vids.length ? `<details><summary>📺 Watch the lecture instead (online)</summary>${vids.slice(0, 2).map((v) => `<div class="vid"><iframe src="${esc(ytEmbed(v.url))}" allowfullscreen loading="lazy"></iframe></div>`).join("")}</details>` : ""}
+      <div class="row-btns"><button class="primary" data-act="lphase" data-p="example">Show me a worked example</button><button data-act="lphase" data-p="try">Skip to practice</button><button data-act="ask-kp">🎩 Ask the tutor</button></div></section>`;
+  else if (ls.phase === "example") body = `<section class="card lesson"><h2>Worked example</h2><p class="pq">${esc(kp.example.q)}</p>
+      <ol class="steps">${kp.example.steps.slice(0, ls.ex).map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
+      ${ls.ex < kp.example.steps.length ? `<p class="muted">Before you reveal it, try to predict the next step.</p><button class="primary" data-act="lex">Next step</button>` : `<button class="primary" data-act="lphase" data-p="try">Now you try</button>`}
+      <button data-act="lphase" data-p="teach">Back to explanation</button></section>`;
+  else {
+    if (!cur || cur.mode !== "lesson" || cur.kp !== kp) newLessonProblem(kp, u);
+    body = `<section class="card lesson"><div class="course-head"><h2 class="grow">Your turn</h2><span class="pill">${ls.streak}/${need} in a row</span></div>${problemHTML()}
+      <p class="muted"><a data-act="lphase" data-p="teach">Re-read the explanation</a> · <a data-act="lphase" data-p="example">See the example</a></p></section>`;
+  }
+  return `<section class="hero"><a class="back" href="#/unit/${uid}">‹ ${esc(u.title)}</a><h1>${esc(u.course.emoji)} Lesson ${ls.k + 1} of ${L.length}</h1><div class="kdots">${dots}</div></section>${body}`;
+}
+function newLessonProblem(kp, u, avoid) {
+  cur = { mode: "lesson", kp, u, p: makeProblem(kp, avoid), answered: null, hint: false,
+    onAnswer: (ok, given) => { recordAnswer(kp, u, cur.p, ok, given, false); if (ok) ls.streak++; else { ls.streak = 0; ls.errs++; } } };
+}
+function lessonNext() {
+  const u = unitById(ls.uid), L = lessonFor(u), kp = L[ls.k], st = kpState(kp.id), need = st.testedOut || st.learned ? 1 : 2;
+  if (ls.streak >= need) {
+    if (!st.learned) { st.learned = dayKey(); const n = schedule({}, ls.errs ? 2 : 3); Object.assign(st, { s: n.s, d: n.d, due: n.due, last: n.last, reps: 1 }); addXP(8, "Concept learned: " + kp.title); }
+    save();
+    const nextK = L.findIndex((x, i) => i > ls.k && !S.kps[x.id]?.learned);
+    if (nextK >= 0) { ls = { ...ls, k: nextK, phase: "teach", ex: 1, streak: 0, errs: 0 }; cur = null; }
+    else if (L.every((x) => S.kps[x.id]?.learned)) { completeStep(ls.uid, "learn"); celebrate("📖 Lesson complete", "Next: practice built from your mistakes."); ls = null; cur = null; go("practice/" + u.id); return; }
+    else { const k0 = L.findIndex((x) => !S.kps[x.id]?.learned); ls = { ...ls, k: k0, phase: "teach", ex: 1, streak: 0, errs: 0 }; cur = null; }
+  } else newLessonProblem(kp, u, cur.p.q);
+  render();
+}
+const ytEmbed = (url) => { const m = String(url).match(/(?:v=|youtu\.be\/|embed\/)([\w-]{11})/); return m ? `https://www.youtube-nocookie.com/embed/${m[1]}` : url; };
+
+// ---- Adaptive check (replaces the flashcard pre-test when a unit has lessons) ----
+let dg = null;
+function vDiag(uid) {
+  const u = unitById(uid), L = lessonFor(u);
+  if (!u || !L) return vUnit(uid);
+  if (!dg || dg.uid !== uid) dg = { uid, k: 0, miss: 0, started: false, known: [] };
+  const head = `<section class="hero"><a class="back" href="#/unit/${uid}">‹ ${esc(u.title)}</a><h1>Quick check</h1><p class="muted">One question per concept. It stops as soon as you hit two things you don't know, so if this is all new it takes 30 seconds.</p></section>`;
+  if (!dg.started) return head + `<section class="card center"><p>${L.length} concepts in this unit. Anything you already know, you'll skip in the lesson.</p><div class="row-btns center"><button class="primary" data-act="dstart">Start the check</button><button data-act="dskip">It's all new to me: start teaching</button></div></section>`;
+  if (dg.done || dg.k >= L.length) {
+    if (!dg.done) finishDiag();
+    const firstNew = L.find((kp) => !S.kps[kp.id]?.testedOut);
+    return head + `<section class="card center"><p>You already know <b>${dg.known.length}</b> of ${L.length} concepts.</p>${firstNew ? `<p>Lessons start at <b>${esc(firstNew.title)}</b>.</p><button class="primary" data-act="lstart" data-unit="${uid}">Start the lesson</button>` : `<p>You know all of it. Go straight to the boss fight.</p><button class="primary" data-go="boss/${uid}">Boss fight</button>`}</section>`;
+  }
+  const kp = L[dg.k];
+  if (!cur || cur.mode !== "diag" || cur.kp !== kp) cur = { mode: "diag", kp, u, p: makeProblem(kp), answered: null, hint: false,
+    onAnswer: (ok, given) => { recordAnswer(kp, u, cur.p, ok, given, false); if (ok) { kpState(kp.id).testedOut = dayKey(); dg.known.push(kp.id); dg.miss = 0; } else dg.miss++; } };
+  return head + `<section class="card"><div class="course-head"><b class="grow">Concept ${dg.k + 1} of ${L.length}</b></div>${problemHTML({ idk: true, noHint: true, noTutor: true })}</section>`;
+}
+function finishDiag() { dg.done = true; completeStep(dg.uid, "pretest"); save(); }
+
+// ---- Practice: generated from your mistakes and weakest concepts ----
+let pr = null;
+function pickPractice(units, lastId) {
+  const pool = learnedKps(units);
+  if (!pool.length) return null;
+  const now = Date.now();
+  const w = pool.map((x) => { const st = S.kps[x.kp.id]; const r = st.s ? retr(Math.max(0, (now - (st.last || now)) / 864e5), st.s) : 0.5; return 1 + 3 * recentErrors(x.kp.id) + 3 * (1 - r) + (x.kp.id === lastId ? -0.9 : 0); });
+  let t = Math.random() * w.reduce((a, b) => a + Math.max(0.1, b), 0);
+  for (let i = 0; i < pool.length; i++) { t -= Math.max(0.1, w[i]); if (t <= 0) return pool[i]; }
+  return pool[pool.length - 1];
+}
+function vPractice(uid) {
+  const all = uid === "all", u = all ? null : unitById(uid), units = all ? allUnits() : [u];
+  if (!all && (!u || !lessonFor(u))) return vUnit(uid);
+  if (!pr || pr.uid !== uid) pr = { uid, n: 0, total: 8, right: 0, last: null };
+  const back = all ? `<a class="back" href="#/today">‹ Today</a>` : `<a class="back" href="#/unit/${uid}">‹ ${esc(u.title)}</a>`;
+  const mistakes = S.mistakes.filter((m) => all || units.some((x) => x.id === m.unit)).slice(0, 6);
+  const head = `<section class="hero">${back}<h1>Practice</h1><p class="muted">Fresh problems, weighted toward what you've gotten wrong and what you're about to forget.</p></section>`;
+  if (pr.n >= pr.total) {
+    const pctv = Math.round((pr.right / pr.total) * 100);
+    if (!all && pctv >= 75 && unitState(uid).steps.learn) completeStep(uid, "practice");
+    const res = `<section class="card center"><h2>${pr.right}/${pr.total} (${pctv}%)</h2><p>${pctv >= 75 ? (all || !unitState(uid).steps.learn ? "Solid." : "Practice step complete. Next: the boss fight.") : "Below 75%. Another round will target exactly the misses."}</p>
+      <div class="row-btns center"><button data-act="pragain">Another round</button>${!all && pctv >= 75 ? `<button class="primary" data-go="boss/${uid}">Boss fight</button>` : ""}</div></section>`;
+    return head + res;
+  }
+  if (!cur || cur.mode !== "practice") {
+    const x = pickPractice(units, pr.last);
+    if (!x) return head + `<section class="card center"><p>Nothing to practice yet: learn a concept first.</p>${all ? "" : `<button class="primary" data-act="lstart" data-unit="${uid}">Start the lesson</button>`}</section>`;
+    pr.last = x.kp.id;
+    cur = { mode: "practice", kp: x.kp, u: x.u, p: makeProblem(x.kp), answered: null, hint: false, onAnswer: (ok, given) => { recordAnswer(cur.kp, cur.u, cur.p, ok, given, true); if (ok) { pr.right++; addXP(2); } } };
+  }
+  return head + `<section class="card"><div class="course-head"><b class="grow">${pr.n + 1} of ${pr.total} · ${esc(cur.kp.title)}</b>${recentErrors(cur.kp.id) ? `<span class="pill bad">missed ${recentErrors(cur.kp.id)}× recently</span>` : ""}</div>${problemHTML()}</section>
+    ${mistakes.length ? `<section class="card"><h2>Recent mistakes</h2>${mistakes.map((m) => `<div class="cardrow"><div class="grow"><b>${esc(m.q)}</b><div class="muted">You said ${esc(m.given)} · answer ${esc(m.a)} · ${fmtDate(m.date)}</div></div></div>`).join("")}</section>` : ""}`;
+}
+
+// ---- Boss fight: one fresh problem per concept, no hints, 80% to pass ----
+let bs = null;
+function vBoss(uid) {
+  const u = unitById(uid), L = lessonFor(u);
+  if (!u || !L) return vUnit(uid);
+  if (!bs || bs.uid !== uid) bs = { uid, list: L.slice(0, 12), i: 0, right: 0, started: false, missed: [] };
+  const head = `<section class="hero"><a class="back" href="#/unit/${uid}">‹ ${esc(u.title)}</a><h1>🐉 Boss fight</h1><p class="muted">${bs.list.length} fresh problems, one per concept. No hints. 80% to master the unit.</p></section>`;
+  if (!bs.started) return head + `<section class="card center"><button class="primary big" data-act="bstart">Fight</button></section>`;
+  if (bs.i >= bs.list.length) {
+    const pctv = Math.round((bs.right / bs.list.length) * 100), st = unitState(uid);
+    if (!bs.scored) { bs.scored = true; st.score = Math.max(st.score || 0, pctv); if (pctv >= 80) { st.steps.check ||= dayKey(); const first = !st.mastered; st.mastered ||= dayKey(); if (first) { addXP(60, "Boss defeated"); celebrate("👑 Unit mastered", u.title); } } save(); }
+    return head + `<section class="card center"><h2>${bs.right}/${bs.list.length} (${pctv}%)</h2><p>${pctv >= 80 ? "Mastered. These concepts now come back in your reviews at spaced intervals." : "Not yet. Your practice is now weighted toward:"}</p>
+      ${bs.missed.length ? `<ul class="left">${bs.missed.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>` : ""}
+      <div class="row-btns center">${pctv >= 80 ? `<button class="primary" data-go="unit/${uid}">Back to unit</button>` : `<button class="primary" data-act="pr-go" data-unit="${uid}">Practice the misses</button><button data-act="bretry">Retry later</button>`}</div></section>`;
+  }
+  const kp = bs.list[bs.i];
+  if (!cur || cur.mode !== "boss" || cur.kp !== kp) cur = { mode: "boss", kp, u, p: makeProblem(kp), answered: null, hint: false, onAnswer: (ok, given) => { recordAnswer(kp, u, cur.p, ok, given, true); if (ok) bs.right++; else bs.missed.push(kp.title); } };
+  return head + `<section class="card"><b>${bs.i + 1} of ${bs.list.length}</b>${problemHTML({ noHint: true, noTutor: true })}</section>`;
+}
+
+// ---- Units without built-in lessons: write them with Claude, or paste them ----
+function validateLesson(arr) {
+  if (!Array.isArray(arr) || !arr.length) throw new Error("Expected a JSON array of concepts");
+  return arr.map((kp, i) => {
+    if (!kp.title || !kp.teach) throw new Error(`Concept ${i + 1} needs a title and teach text`);
+    const problems = (kp.problems || []).filter((p) => p.q && p.sol && (p.type === "num" ? Number.isFinite(Number(p.a)) : p.type === "mc" ? Array.isArray(p.choices) && p.choices[p.a] !== undefined : p.type === "text" ? Array.isArray(p.a) && p.a.length : false)).map((p) => ({ ...p, a: p.type === "num" ? Number(p.a) : p.a }));
+    if (!problems.length) throw new Error(`Concept “${kp.title}” has no valid practice problems`);
+    return { id: "g-" + slug(kp.id || kp.title) + "-" + uid6().slice(0, 3), title: String(kp.title), teach: String(kp.teach), example: kp.example?.q && Array.isArray(kp.example.steps) ? kp.example : { q: problems[0].q, steps: [problems[0].sol] }, problems };
+  });
+}
+async function writeLessons(uid) {
+  const u = unitById(uid);
+  if (!cloudReady()) { toast("Add your Claude API key in Settings first, and be online"); return; }
+  let notes = "";
+  const hit = u.resources.map((r, i) => ({ r, k: rkey(u, r, i) })).find((x) => x.r.type !== "video" && S.files[x.k]);
+  if (hit) { try { notes = await pdfText((await fileGet(S.files[hit.k])).blob, 16000); } catch (e) { console.warn(e); } }
+  const prompt = LESSON_PROMPT.replace("<COURSE NAME>", u.course.name + (u.course.source ? ` (${u.course.source})` : "")).replace("<UNIT TITLE>", u.title).replace("<CONCEPTS>", u.concepts.join(", ") || "infer from the title").replace('<PASTE TEXT OR SAY "use the standard curriculum">', notes ? notes : "use the standard curriculum for this course");
+  toast("🎩 Writing your lessons… about a minute");
+  writing = uid; render();
+  try {
+    let out = "";
+    for await (const t of claudeStream("You write accurate, rigorous lesson content as strict JSON.", [{ role: "user", content: prompt }], 12000)) out += t;
+    const arr = validateLesson(JSON.parse(out.slice(out.indexOf("["), out.lastIndexOf("]") + 1)));
+    S.genLessons[uid] = arr; save(); toast(`📖 ${arr.length} lessons written`);
+  } catch (e) { console.error(e); toast("⚠️ Couldn't write lessons: " + (e.message || e)); }
+  writing = null; render();
+}
+let writing = null;
+
 /* ============================== Review ============================== */
 let rv = { queue: [], i: 0, shown: false, done: 0, mode: "srs", unit: null, known: 0 };
+function buildReviewQueue() {
+  const cards = dueCards().map((c) => c.id), kps = dueKps().map((x) => "kp:" + x.kp.id), out = [];
+  while (cards.length || kps.length) { if (kps.length) out.push(kps.shift()); if (cards.length) out.push(cards.shift()); if (cards.length) out.push(cards.shift()); }
+  return out;
+}
 function vReview() {
-  if (rv.mode === "srs" && !rv.queue.length) rv.queue = dueCards().map((c) => c.id);
-  const c = rv.queue[rv.i] ? allCards().find((x) => x.id === rv.queue[rv.i]) : null;
+  if (rv.mode === "srs" && !rv.queue.length) rv.queue = buildReviewQueue();
+  const qid = rv.queue[rv.i];
+  if (qid && qid.startsWith("kp:")) {
+    const x = learnedKps(allUnits()).find((y) => y.kp.id === qid.slice(3));
+    if (!x) { rv.i++; return vReview(); }
+    if (!cur || cur.mode !== "review" || cur.qi !== rv.i) cur = { mode: "review", qi: rv.i, kp: x.kp, u: x.u, p: makeProblem(x.kp), answered: null, hint: false, onAnswer: (ok, given) => { recordAnswer(x.kp, x.u, cur.p, ok, given, true); today().reviews++; addXP(ok ? 2 : 1); if (!ok) rv.queue.push(qid); } };
+    return `<section class="hero"><h1>Review</h1><p class="muted">${rv.queue.length - rv.i} left · <span style="color:${x.u.course.color}">${esc(x.u.course.emoji + " " + x.u.course.name)}</span> · ${esc(x.kp.title)}</p></section><section class="card">${problemHTML()}</section>`;
+  }
+  const c = qid ? allCards().find((x) => x.id === qid) : null;
+  if (qid && !c) { rv.i++; return vReview(); }
   if (!c) {
-    const summary = rv.mode === "pretest" ? `<p>Pre-test: you knew <b>${rv.known}/${rv.done}</b>. Study only the ones you missed.</p><button class="primary" data-go="unit/${rv.unit}">Back to unit</button>` : rv.done ? `<p>Session done: <b>${rv.done}</b> cards reviewed. 🎉</p><button class="primary" data-go="today">Back to today's session</button>` : `<p>No cards due. ${allCards().some((x) => x.active) ? "Come back later." : "Cards join your reviews at each unit's Lock in step."}</p>`;
+    const summary = rv.mode === "pretest" ? `<p>Pre-test: you knew <b>${rv.known}/${rv.done}</b>. Study only the ones you missed.</p><button class="primary" data-go="unit/${rv.unit}">Back to unit</button>` : rv.done ? `<p>Session done: <b>${rv.done}</b> items reviewed. 🎉</p><button class="primary" data-go="today">Back to today's session</button>` : `<p>Nothing due. Concepts you learn and cards you lock in come back here on a spaced schedule.</p>`;
     rv = { queue: [], i: 0, shown: false, done: 0, mode: "srs", unit: null, known: 0 };
     return `<section class="hero"><h1>Review</h1></section><section class="card center">${summary}</section>`;
   }
@@ -563,29 +807,51 @@ const MODES = {
   explain: ["💡 Explain", "Explain the concept the learner names simply, with one concrete example, then ask one question to check understanding."],
   cards: ["🃏 Make cards", "Turn the provided material into 5 to 8 flashcards. Output ONLY a JSON array like [{\"front\":\"question\",\"back\":\"short answer\"}]. One fact per card. No other text."],
 };
-const tutor = { engine: null, loading: false, progress: "", mode: "socratic", unit: null, msgs: [], busy: false, ctx: "", draft: "" };
+const tutor = { engine: null, loading: false, progress: "", mode: "socratic", unit: null, msgs: [], busy: false, ctx: "", draft: "", returnTo: null };
+// Optional stronger tutor: Claude via the user's own API key, used whenever it's set and the device is online.
+let cloudKey = null;
+const cloudReady = () => !!cloudKey && navigator.onLine;
+async function* claudeStream(system, messages, maxTokens = 1024) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": cloudKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }, body: JSON.stringify({ model: S.settings.cloudModel || "claude-sonnet-5-5", max_tokens: maxTokens, system, messages, stream: true }) });
+  if (!r.ok) { let m = ""; try { m = (await r.json()).error?.message || ""; } catch {} throw new Error(`Claude API ${r.status}${m ? ": " + m : ""}`); }
+  const rd = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await rd.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
+      if (j.type === "error") throw new Error(j.error?.message || "stream error");
+      if (j.type === "content_block_delta" && j.delta?.text) yield j.delta.text;
+    }
+  }
+}
 function systemPrompt() {
   const u = tutor.unit ? unitById(tutor.unit) : null;
   return [
-    `You are a patient expert tutor.${u ? ` Subject: ${u.course.name} (${u.course.source || ""}), unit "${u.title}". Key concepts: ${u.concepts.join(", ")}.` : ""}`,
+    `You are Ben's private tutor, in the manner of a Victorian household tutor: one-on-one, attentive, demanding but warm. You lead the session: you decide what he needs next, explain it clearly, then make him demonstrate it. Plain modern English, no costume.${u ? ` Subject: ${u.course.name} (${u.course.source || ""}), unit "${u.title}". Key concepts: ${u.concepts.join(", ")}.` : ""}`,
     "Rules:",
     "1. Keep replies short: at most about 120 words. Ask at most one question at a time.",
     "2. Never give a full solution to a problem the learner hasn't attempted. Give the smallest useful hint, then ask them to try.",
     "3. When the learner answers, say clearly whether it's right and why, and correct misconceptions directly.",
     "4. Check understanding by asking them to explain in their own words or apply the idea to a new example.",
     "5. If they ask a direct factual question (a definition, a formula), answer it plainly.",
-    "6. If you're not sure, say so and point them to the lecture notes. Never invent facts or sources.",
+    "6. If you're not sure, say so. Never invent facts or sources.",
+    "7. When the learner got a problem wrong, find the specific misconception behind their answer, explain it, then give one similar problem (new numbers) and wait for their attempt.",
     `Mode: ${MODES[tutor.mode][1]}`,
     tutor.ctx ? `Material the learner provided:\n"""${tutor.ctx.slice(0, 6000)}"""` : "",
-    "/no_think",
+    cloudReady() ? "" : "/no_think",
   ].filter(Boolean).join("\n");
 }
 function vTutor(arg) {
   if (arg && unitById(arg)) tutor.unit = arg;
   const gpu = !!navigator.gpu;
-  return `<section class="hero"><h1>Tutor</h1><p class="muted">Runs entirely on your iPad once downloaded. It gives hints, not answers.</p></section>
-  ${!gpu ? `<section class="card warn"><p>WebGPU isn't available in this browser, so the local model can't run here. Use Safari on iPadOS 26 or later.</p></section>` : ""}
-  <section class="card">${tutor.engine ? `<p class="muted">✅ Model loaded: ${esc(S.settings.model)}</p>` : `
+  return `<section class="hero">${tutor.returnTo ? `<a class="back" href="${esc(tutor.returnTo)}">‹ Back to where you were</a>` : ""}<h1>🎩 Tutor</h1><p class="muted">${cloudReady() ? "Using Claude (online, your API key)." : "Using the on-device model (works offline). Add a Claude API key in Settings for a much stronger tutor when online."}</p></section>
+  ${!gpu && !cloudReady() ? `<section class="card warn"><p>WebGPU isn't available in this browser, so the local model can't run here. Use Safari on iPadOS 26+ or Chrome, or add a Claude API key.</p></section>` : ""}
+  <section class="card">${cloudReady() ? "" : tutor.engine ? `<p class="muted">✅ Model loaded: ${esc(S.settings.model)}</p>` : `
     <label>Model <select id="tmodel">${MODELS.map(([id, n]) => `<option value="${id}" ${id === S.settings.model ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
     <button class="primary" data-act="tload" ${!gpu || tutor.loading ? "disabled" : ""}>${tutor.loading ? "Loading…" : "Load model"}</button>
     <p class="muted" id="tprog">${esc(tutor.progress || "The first load downloads the model once (use Wi-Fi). After that it works offline.")}</p>`}
@@ -621,14 +887,16 @@ async function tutorSend() {
   const text = $("#tin")?.value.trim();
   if (!text || tutor.busy) return;
   tutor.ctx = $("#tctx")?.value ?? tutor.ctx; tutor.draft = "";
-  if (!tutor.engine) { toast("Load the model first"); return; }
+  const useCloud = cloudReady();
+  if (!useCloud && !tutor.engine) { toast("Load the model first (or add a Claude API key in Settings)"); return; }
   tutor.msgs.push({ role: "user", content: text });
   const reply = { role: "assistant", content: "", mode: tutor.mode, streaming: true };
   tutor.msgs.push(reply); tutor.busy = true; render();
   try {
     const history = tutor.msgs.filter((m) => m !== reply).slice(-8).map((m) => ({ role: m.role, content: m.role === "assistant" ? stripThink(m.content) : m.content }));
-    const stream = await tutor.engine.chat.completions.create({ messages: [{ role: "system", content: systemPrompt() }, ...history], stream: true, temperature: tutor.mode === "cards" ? 0.3 : 0.6, max_tokens: 700 });
-    for await (const chunk of stream) {
+    const paint = () => { const box = $("#tchat"); if (box?.lastElementChild) { box.lastElementChild.innerHTML = md(stripThink(reply.content) || "…"); box.scrollTop = box.scrollHeight; } };
+    if (useCloud) { for await (const t of claudeStream(systemPrompt(), history, 1200)) { reply.content += t; paint(); } }
+    else for await (const chunk of await tutor.engine.chat.completions.create({ messages: [{ role: "system", content: systemPrompt() }, ...history], stream: true, temperature: tutor.mode === "cards" ? 0.3 : 0.6, max_tokens: 700 })) {
       reply.content += chunk.choices?.[0]?.delta?.content || "";
       const box = $("#tchat");
       if (box?.lastElementChild) { box.lastElementChild.innerHTML = md(stripThink(reply.content) || "…"); box.scrollTop = box.scrollHeight; }
@@ -836,6 +1104,10 @@ function vSettings() {
     <label>Break minutes/day <input type="number" data-set="break" value="${s.minutes.break}" inputmode="numeric"></label>
     <label>Subjects per day (max) <input type="number" min="1" max="8" data-set="maxSubjects" value="${s.maxSubjects}" inputmode="numeric"></label></div>
     <p class="muted">Each day the app splits your time across active courses by priority, how far behind each is, and how much time each got this past week. Switch Term/Break on the Today screen.</p></section>
+  <section class="card"><h2>🎩 Stronger tutor (optional, online)</h2>
+    <p class="muted">The built-in lessons and practice work offline with no AI. The tutor uses a small on-device model, which is fine for hints but makes mistakes. With your own Claude API key, the tutor uses Claude whenever you're online, and it can write full lessons for any unit that doesn't have them yet. Usage is billed to your Anthropic account (a tutoring session typically costs a few cents). The key stays on this device and is never synced.</p>
+    <div class="inline"><input type="password" id="cloudkey" placeholder="sk-ant-…" value="${cloudKey ? "••••••••" : ""}" autocomplete="off"><input id="cloudmodel" value="${esc(S.settings.cloudModel || "claude-sonnet-5-5")}" style="max-width:220px"><button class="primary" data-act="cloud-save">Save</button></div>
+    <p class="muted">Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. Leave blank and Save to turn it off.</p></section>
   <section class="card"><h2>Sync across devices</h2>
     ${syncToken ? `<p>✅ This device is connected. <span class="muted" id="syncstat">${esc(syncStatus)}</span></p><div class="row-btns"><button class="primary" data-act="sync-now">Sync now</button><button data-act="sync-off">Disconnect this device</button></div>
       <p class="muted">Syncs automatically when the app opens, when you switch away from it, when you come back online, and 15 seconds after any change.</p>` : `
@@ -912,10 +1184,49 @@ document.addEventListener("click", async (e) => {
   const act = a.dataset.act, uid = a.dataset.unit;
   try { switch (act) {
     case "close-modal": closeModal(); break;
+    case "pchoice": answer(Number(a.dataset.i)); break;
+    case "pcheck": { const v = $("#pans")?.value || ""; if (!v.trim()) { toast("Type an answer, or use the hint"); break; } answer(v); break; }
+    case "pidk": answer("", true); break;
+    case "phint": cur.hint = true; render(); break;
+    case "pnext": {
+      const m = cur?.mode;
+      if (m === "lesson") { lessonNext(); break; }
+      if (m === "diag") { dg.k++; if (dg.miss >= 2) finishDiag(); cur = null; }
+      else if (m === "practice") { pr.n++; cur = null; }
+      else if (m === "boss") { bs.i++; cur = null; }
+      else if (m === "review") { rv.i++; rv.done++; cur = null; }
+      render(); break;
+    }
+    case "ask-kp": {
+      const kp = cur?.kp || lessonFor(unitById(ls?.uid))?.[ls?.k], u = cur?.u || unitById(ls?.uid);
+      if (!kp) break;
+      const tmp = document.createElement("div"); tmp.innerHTML = kp.teach;
+      tutor.unit = u.id; tutor.mode = "socratic"; tutor.returnTo = location.hash;
+      tutor.ctx = `Lesson: ${kp.title}\n${tmp.textContent}` + (cur?.p ? `\n\nProblem: ${cur.p.q}\nCorrect answer: ${shown(cur.p)}\nWorked solution: ${cur.p.sol}` + (cur.answered && !cur.answered.ok ? `\nBen answered: ${cur.p.type === "mc" ? cur.p.choices[cur.answered.given] ?? "(didn't know)" : cur.answered.given || "(didn't know)"}` : "") : "");
+      tutor.draft = cur?.answered && !cur.answered.ok ? "I got this wrong. What am I misunderstanding?" : "Can you explain this another way?";
+      go("tutor"); break;
+    }
+    case "lstart": startLesson(a.dataset.unit, a.dataset.k !== undefined ? Number(a.dataset.k) : undefined); go("lesson/" + a.dataset.unit); break;
+    case "lgoto": ls = { ...ls, k: Number(a.dataset.k), phase: "teach", ex: 1, streak: 0, errs: 0 }; cur = null; render(); break;
+    case "lphase": ls.phase = a.dataset.p; if (a.dataset.p === "example") ls.ex = 1; render(); break;
+    case "lex": ls.ex++; render(); break;
+    case "dgo": dg = null; cur = null; go("diag/" + a.dataset.unit); break;
+    case "dstart": dg.started = true; render(); break;
+    case "dskip": { const id = a.dataset.unit || dg?.uid; completeStep(id, "pretest"); save(); dg = null; startLesson(id); go("lesson/" + id); break; }
+    case "pr-go": pr = null; cur = null; go("practice/" + a.dataset.unit); break;
+    case "pragain": pr = { ...pr, n: 0, right: 0 }; cur = null; render(); break;
+    case "boss-go": bs = null; cur = null; go("boss/" + a.dataset.unit); break;
+    case "bstart": bs.started = true; render(); break;
+    case "bretry": { const id = bs?.uid; bs = null; cur = null; go("unit/" + id); break; }
+    case "write-lessons": writeLessons(a.dataset.unit); break;
+    case "paste-lessons": modal(`<h2>Paste lessons</h2><p class="muted">A JSON array of concepts (from Claude chat, using the copied prompt).</p><textarea id="lessontext" rows="12"></textarea><button class="primary" data-act="paste-lessons-go" data-unit="${a.dataset.unit}">Import</button>`); break;
+    case "paste-lessons-go": { const t = $("#lessontext").value; const arr = validateLesson(JSON.parse(t.slice(t.indexOf("["), t.lastIndexOf("]") + 1))); S.genLessons[a.dataset.unit] = arr; save(); closeModal(); toast(`📖 ${arr.length} lessons added`); render(); break; }
+    case "copy-lprompt": { const u = unitById(a.dataset.unit); const txt = LESSON_PROMPT.replace("<COURSE NAME>", u.course.name).replace("<UNIT TITLE>", u.title).replace("<CONCEPTS>", u.concepts.join(", ")); try { await navigator.clipboard.writeText(txt); toast("Prompt copied: paste it into Claude, then paste the result back here"); } catch { modal(`<textarea rows="14">${esc(txt)}</textarea>`); } break; }
+    case "cloud-save": { const raw = $("#cloudkey").value.trim(); const k = raw === "••••••••" ? cloudKey : raw; cloudKey = k || null; await kvPut("cloudKey", cloudKey); S.settings.cloudModel = $("#cloudmodel").value.trim() || "claude-sonnet-5-5"; save(); toast(k ? "Claude tutor on" : "Claude tutor off"); render(); break; }
     case "chest": { const d = today(); if (!d.chest) { d.chest = true; addXP(50, "Daily chest"); celebrate("🎁 +50 XP", "All quests complete."); render(); } break; }
     case "mode": S.settings.mode = a.dataset.mode; save(); render(); break;
     case "timer": startTimer(uid, Number(a.dataset.min)); break;
-    case "block-start": startTimer(uid, Number(a.dataset.min), a.dataset.course); go("unit/" + uid); break;
+    case "block-start": startTimer(uid, Number(a.dataset.min), a.dataset.course); cur = null; go(stepRoute(uid)); break;
     case "block-done": completeBlock(a.dataset.course); save(); render(); break;
     case "stop-timer": stopTimer(); break;
     case "step": {
@@ -1056,6 +1367,8 @@ document.addEventListener("change", async (e) => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.target.id === "tin" && e.key === "Enter" && !e.shiftKey) { e.preventDefault(); tutorSend(); }
+  if (e.target.id === "pans" && e.key === "Enter") { e.preventDefault(); $('[data-act="pcheck"]')?.click(); }
+  if (e.key === "Enter" && cur?.answered && !e.target.closest("textarea,input")) { e.preventDefault(); $('[data-act="pnext"]')?.click(); }
   if (route().view === "review" && !e.target.closest("input,textarea")) {
     if (e.key === " " && !rv.shown) { e.preventDefault(); rv.shown = true; render(); }
     else if (rv.shown && rv.mode === "srs" && ["1", "2", "3", "4"].includes(e.key)) $(`[data-act="grade"][data-g="${e.key}"]`)?.click();
@@ -1065,11 +1378,11 @@ document.addEventListener("keydown", (e) => {
 /* ============================== Boot ============================== */
 async function boot() {
   try { const saved = await kvGet("state"); if (saved?.version) S = migrate(saved); } catch (e) { console.warn("Storage unavailable", e); }
-  try { syncToken = (await kvGet("syncToken")) || null; } catch {}
+  try { syncToken = (await kvGet("syncToken")) || null; cloudKey = (await kvGet("cloudKey")) || null; } catch {}
   invalidate(); render(); renderTimer();
   if (syncToken) syncNow();
   if ("serviceWorker" in navigator && location.protocol !== "file:") navigator.serviceWorker.register("./sw.js").catch((e) => console.warn("SW failed", e));
   try { if (navigator.storage?.persisted && !(await navigator.storage.persisted())) navigator.storage.persist?.(); } catch {}
-  window.__sq = { state: () => S, schedule, render, planToday, courses, mergeStates, setState: (x) => { S = x; invalidate(); } };
+  window.__sq = { cur: () => cur, state: () => S, schedule, render, planToday, courses, mergeStates, setState: (x) => { S = x; invalidate(); } };
 }
 boot();
