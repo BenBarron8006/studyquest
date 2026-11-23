@@ -1,6 +1,6 @@
 // StudyQuest service worker: caches the app shell so it runs fully offline.
 // Model weights are cached separately by WebLLM; never delete caches it owns.
-const VERSION = "sq-v2.2.0";
+const VERSION = "sq-v2.2.1";
 const SHELL = [
   "./", "./index.html", "./app.js", "./data.js", "./library.js", "./lessons.js", "./gens.js", "./method.js", "./style.css", "./manifest.webmanifest",
   "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png",
@@ -8,7 +8,7 @@ const SHELL = [
 ];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: "reload" })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener("activate", (e) => {
