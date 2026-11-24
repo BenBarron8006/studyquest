@@ -2,7 +2,8 @@ import { BUILTIN, STEPS, SEED_CARDS, PUZZLES, MARKETS, TITLES } from "./data.js"
 import { LIBRARY, PACK_PROMPT } from "./library.js";
 import { METHOD } from "./method.js";
 import { LESSONS, LESSON_PROMPT } from "./lessons.js";
-import { GEN, checkAnswer } from "./gens.js";
+import { GEN, checkAnswer, setProfile } from "./gens.js";
+import { PERSONAL, EXTRA_PROBLEMS, DEFAULT_PROFILE } from "./personal.js";
 import { PUZZLE_BANK, puzzleSet, genPuzzle, genSequence, genBet, genBlitz } from "./games.js";
 
 /* ============================== Storage ============================== */
@@ -50,7 +51,7 @@ const DEFAULT_STATE = () => ({
   enabled: ["ling", "prob"],
   customCourses: [],
   coursePrefs: {},
-  sync: {}, updatedAt: 0, kps: {}, mistakes: [], genLessons: {},
+  sync: {}, updatedAt: 0, kps: {}, mistakes: [], genLessons: {}, profile: { ...DEFAULT_PROFILE }, firstTry: [],
   settings: { model: "Qwen3.5-2B-q4f16_1-MLC", mode: "break", minutes: { term: 120, break: 180 }, maxSubjects: 4 },
 });
 let S = DEFAULT_STATE();
@@ -120,7 +121,7 @@ async function findGist() {
 function mergeStates(a, b) {
   const mx = (x, y) => Math.max(x || 0, y || 0), newer = (b.updatedAt || 0) > (a.updatedAt || 0) ? b : a;
   const o = { ...a, version: 2, created: Math.min(a.created || Date.now(), b.created || Date.now()), updatedAt: mx(a.updatedAt, b.updatedAt) };
-  for (const f of ["enabled", "coursePrefs", "settings", "goals", "customCourses"]) if (newer[f] !== undefined) o[f] = newer[f];
+  for (const f of ["enabled", "coursePrefs", "settings", "goals", "customCourses", "profile"]) if (newer[f] !== undefined) o[f] = newer[f];
   o.days = { ...a.days };
   for (const [k, d] of Object.entries(b.days || {})) {
     const l = o.days[k]; if (!l) { o.days[k] = d; continue; }
@@ -497,8 +498,10 @@ const safeHTML = (s) => esc(s).replace(/&lt;(\/?)(b|i|sup|sub|br)\s*\/?&gt;/g, "
 function asFrac(x) { if (Number.isInteger(x)) return x.toLocaleString(); for (let q = 2; q <= 5000; q++) { const n = Math.round(x * q); if (Math.abs(n / q - x) < 1e-9) return `${n}/${q} (≈ ${Math.round(x * 10000) / 10000})`; } return String(Math.round(x * 10000) / 10000); }
 const shown = (p) => (p.type === "mc" ? p.choices[p.a] : p.type === "text" ? p.a[0] : asFrac(p.a));
 function makeProblem(kp, avoidQ) {
+  const ex = EXTRA_PROBLEMS[kp.id];
+  if (kp.gen && ex && S.profile?.interests?.includes("languages") && Math.random() < 0.3) { const i = Math.floor(Math.random() * ex.length); if (ex[i].q !== avoidQ) return { ...ex[i] }; }
   if (kp.gen && GEN[kp.gen]) { let p; for (let t = 0; t < 4; t++) { p = GEN[kp.gen](); if (p.q !== avoidQ) break; } return p; }
-  const P = kp.problems || [], st = kpState(kp.id);
+  const P = [...(kp.problems || []), ...(EXTRA_PROBLEMS[kp.id] || [])], st = kpState(kp.id);
   if (!P.length) return null;
   const idx = P.map((_, i) => i).filter((i) => P[i].q !== avoidQ);
   const fresh = idx.filter((i) => st.seen[i] !== true); // never answered correctly
@@ -556,8 +559,28 @@ let ls = null;
 function startLesson(uid, k) {
   const L = lessonFor(unitById(uid));
   const first = L.findIndex((kp) => !S.kps[kp.id]?.learned);
-  ls = { uid, k: k ?? (first < 0 ? 0 : first), phase: "teach", ex: 1, streak: 0, errs: 0 };
+  const kk = k ?? (first < 0 ? 0 : first);
+  ls = { uid, k: kk, phase: openingPhase(L[kk]), ex: 1, streak: 0, errs: 0 };
   cur = null;
+}
+// Adaptive scaffolding (expertise reversal): worked examples first while you're new; once your first attempts
+// are mostly right, new concepts open with a problem and the explanation appears only if you need it.
+function scaffoldLevel() { const f = (S.firstTry || []).slice(-10); return f.length >= 5 ? f.filter(Boolean).length / f.length : 0; }
+function openingPhase(kp) {
+  const mode = S.profile?.scaffold || "adaptive";
+  if (!kp || S.kps[kp.id]?.learned) return "teach";
+  if (mode === "problem-first" || (mode === "adaptive" && scaffoldLevel() >= 0.8)) return "cold";
+  return "teach";
+}
+function teachHTML(kp) {
+  const P = PERSONAL[kp.id] || {}, style = S.profile?.style || "intuition-formal", goals = S.profile?.goals || [];
+  const formal = P.formal ? `<div class="formal"><b>Formally.</b> ${safeHTML(P.formal)}</div>` : "";
+  const intuition = `<div class="teach">${safeHTML(kp.teach)}</div>`;
+  const uses = Object.entries(P.use || {}).filter(([g]) => goals.includes(g));
+  const useHTML = uses.length ? `<div class="use">${uses.map(([g, t]) => `<p><b>${{ interviews: "In interviews", signal: "For your trading signal", languages: "For Kazakh and Mandarin" }[g]}:</b> ${esc(t)}</p>`).join("")}</div>` : "";
+  if (style === "formal-first") return formal + intuition + useHTML;
+  if (style === "intuition-only") return intuition + (P.formal ? `<details><summary>Formal statement</summary>${formal}</details>` : "") + useHTML;
+  return intuition + formal + useHTML;
 }
 function vLesson(uid) {
   const u = unitById(uid), L = lessonFor(u);
@@ -567,7 +590,11 @@ function vLesson(uid) {
   const vids = u.resources.filter((r) => r.type === "video" && /youtu/.test(r.url || ""));
   const dots = L.map((x, i) => `<a class="kdot ${S.kps[x.id]?.learned ? "done" : S.kps[x.id]?.testedOut ? "tested" : ""} ${i === ls.k ? "on" : ""}" data-act="lgoto" data-k="${i}" title="${esc(x.title)}"></a>`).join("");
   let body = "";
-  if (ls.phase === "teach") body = `<section class="card lesson"><h2>${esc(kp.title)}</h2><div class="teach">${safeHTML(kp.teach)}</div>
+  if (ls.phase === "cold") {
+    if (!cur || cur.mode !== "lesson" || cur.kp !== kp) newLessonProblem(kp, u);
+    body = `<section class="card lesson"><div class="course-head"><h2 class="grow">${esc(kp.title)}</h2><span class="pill">try it first</span></div><p class="muted">You've been getting new concepts right on the first try, so this one starts with a problem. Get it right and you've shown you can do it; miss it and you'll get the explanation.</p>${problemHTML()}
+      <p class="muted"><a data-act="lphase" data-p="teach">Show me the explanation first</a></p></section>`;
+  } else if (ls.phase === "teach") body = `<section class="card lesson"><h2>${esc(kp.title)}</h2>${teachHTML(kp)}
       ${ls.k === 0 && vids.length ? `<details><summary>📺 Watch the lecture instead (online)</summary>${vids.slice(0, 2).map((v) => `<div class="vid"><iframe src="${esc(ytEmbed(v.url))}" allowfullscreen loading="lazy"></iframe></div>`).join("")}</details>` : ""}
       <div class="row-btns"><button class="primary" data-act="lphase" data-p="example">Show me a worked example</button><button data-act="lphase" data-p="try">Skip to practice</button><button data-act="ask-kp">🎩 Ask the tutor</button></div></section>`;
   else if (ls.phase === "example") body = `<section class="card lesson"><h2>Worked example</h2><p class="pq">${esc(kp.example.q)}</p>
@@ -583,17 +610,25 @@ function vLesson(uid) {
 }
 function newLessonProblem(kp, u, avoid) {
   cur = { mode: "lesson", kp, u, p: makeProblem(kp, avoid), answered: null, hint: false,
-    onAnswer: (ok, given) => { recordAnswer(kp, u, cur.p, ok, given, false); if (ok) ls.streak++; else { ls.streak = 0; ls.errs++; } } };
+    onAnswer: (ok, given) => {
+      recordAnswer(kp, u, cur.p, ok, given, false);
+      if (!ls.firstDone) { ls.firstDone = true; S.firstTry = [...(S.firstTry || []), ok].slice(-20); }
+      if (ok) ls.streak++; else { ls.streak = 0; ls.errs++; }
+    } };
 }
 function lessonNext() {
   const u = unitById(ls.uid), L = lessonFor(u), kp = L[ls.k], st = kpState(kp.id), need = st.testedOut || st.learned ? 1 : 2;
+  if (ls.phase === "cold") {
+    if (!cur.answered.ok) { ls.phase = "teach"; cur = null; render(); return; } // missed cold: teach it
+    ls.phase = "try"; // got it cold: one more to confirm
+  }
   if (ls.streak >= need) {
     if (!st.learned) { st.learned = dayKey(); const n = schedule({}, ls.errs ? 2 : 3); Object.assign(st, { s: n.s, d: n.d, due: n.due, last: n.last, reps: 1 }); addXP(8, "Concept learned: " + kp.title); }
     save();
     const nextK = L.findIndex((x, i) => i > ls.k && !S.kps[x.id]?.learned);
-    if (nextK >= 0) { ls = { ...ls, k: nextK, phase: "teach", ex: 1, streak: 0, errs: 0 }; cur = null; }
+    if (nextK >= 0) { ls = { ...ls, k: nextK, phase: openingPhase(L[nextK]), ex: 1, streak: 0, errs: 0, firstDone: false }; cur = null; }
     else if (L.every((x) => S.kps[x.id]?.learned)) { completeStep(ls.uid, "learn"); celebrate("📖 Lesson complete", "Next: practice built from your mistakes."); ls = null; cur = null; go("practice/" + u.id); return; }
-    else { const k0 = L.findIndex((x) => !S.kps[x.id]?.learned); ls = { ...ls, k: k0, phase: "teach", ex: 1, streak: 0, errs: 0 }; cur = null; }
+    else { const k0 = L.findIndex((x) => !S.kps[x.id]?.learned); ls = { ...ls, k: k0, phase: openingPhase(L[k0]), ex: 1, streak: 0, errs: 0, firstDone: false }; cur = null; }
   } else newLessonProblem(kp, u, cur.p.q);
   render();
 }
@@ -889,10 +924,18 @@ async function* claudeStream(system, messages, maxTokens = 1024) {
     }
   }
 }
+function profileLine() {
+  const p = S.profile || {};
+  const style = { "intuition-formal": "Explain with intuition and a concrete example first, then the precise formal statement and a brief reason it's true. He has strong abstract-math training (proofs, algebra, real analysis) but is new to statistics and finance.", "formal-first": "Lead with definitions and theorems, then examples. He has strong abstract-math training.", "intuition-only": "Keep formalism minimal; build intuition and fluency." }[p.style] || "";
+  const ints = (p.interests || []).map((i) => ({ trading: "trading and markets (Kazakh assets, the tenge, central-bank decisions)", languages: "languages (native Russian, fluent French; learning Mandarin and Kazakh)", philosophy: "philosophy and logic" }[i])).filter(Boolean);
+  const goals = (p.goals || []).map((g) => ({ interviews: "pass quant trading interviews", signal: "build a Russian-language news trading signal on Kazakh assets", languages: "learn Kazakh and Mandarin faster" }[g])).filter(Boolean);
+  return `About the learner (Ben): ${style}${ints.length ? ` When an example helps, draw it from ${ints.join("; ")}.` : ""}${goals.length ? ` His goals: ${goals.join("; ")}. Connect ideas to these when it's genuinely relevant.` : ""}`;
+}
 function systemPrompt() {
   const u = tutor.unit ? unitById(tutor.unit) : null;
   return [
     `You are Ben's private tutor, in the manner of a Victorian household tutor: one-on-one, attentive, demanding but warm. You lead the session: you decide what he needs next, explain it clearly, then make him demonstrate it. Plain modern English, no costume.${u ? ` Subject: ${u.course.name} (${u.course.source || ""}), unit "${u.title}". Key concepts: ${u.concepts.join(", ")}.` : ""}`,
+    profileLine(),
     "Rules:",
     "1. Keep replies short: at most about 120 words. Ask at most one question at a time.",
     "2. Never give a full solution to a problem the learner hasn't attempted. Give the smallest useful hint, then ask them to try.",
@@ -1164,6 +1207,14 @@ function vSettings() {
     <label>Break minutes/day <input type="number" data-set="break" value="${s.minutes.break}" inputmode="numeric"></label>
     <label>Subjects per day (max) <input type="number" min="1" max="8" data-set="maxSubjects" value="${s.maxSubjects}" inputmode="numeric"></label></div>
     <p class="muted">Each day the app splits your time across active courses by priority, how far behind each is, and how much time each got this past week. Switch Term/Break on the Today screen.</p></section>
+  <section class="card"><h2>Your learning profile</h2>
+    <p class="muted">Shapes how lessons explain things, how much scaffolding you get, and what the practice problems are about. The tutor sees it too.</p>
+    <div class="inline">
+      <label>Explanations <select data-prof="style">${[["intuition-formal", "Intuition, then formal"], ["formal-first", "Formal first"], ["intuition-only", "Intuition only"]].map(([v, n]) => `<option value="${v}" ${S.profile?.style === v ? "selected" : ""}>${n}</option>`).join("")}</select></label>
+      <label>Scaffolding <select data-prof="scaffold">${[["adaptive", "Adapt automatically"], ["problem-first", "Problem first"], ["examples", "Always worked example"]].map(([v, n]) => `<option value="${v}" ${S.profile?.scaffold === v ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>
+    <p><b>Problem contexts</b> ${[["trading", "Trading and markets"], ["languages", "Languages"], ["philosophy", "Philosophy and logic"]].map(([v, n]) => `<label class="switch"><input type="checkbox" data-profset="interests" value="${v}" ${S.profile?.interests?.includes(v) ? "checked" : ""}><span>${n}</span></label>`).join(" ")}</p>
+    <p><b>Goals</b> ${[["interviews", "Trading interviews"], ["signal", "Trading signal"], ["languages", "Language learning"]].map(([v, n]) => `<label class="switch"><input type="checkbox" data-profset="goals" value="${v}" ${S.profile?.goals?.includes(v) ? "checked" : ""}><span>${n}</span></label>`).join(" ")}</p>
+    <p class="muted">${S.profile?.scaffold === "adaptive" ? `First-try accuracy on new concepts: ${Math.round(scaffoldLevel() * 100)}% over your last ${Math.min(10, (S.firstTry || []).length)}. ${scaffoldLevel() >= 0.8 ? "New concepts now open with a problem." : "New concepts open with an explanation and worked example; at 80% they'll switch to problem-first."}` : ""}</p></section>
   <section class="card"><h2>🎩 Stronger tutor (optional, online)</h2>
     <p class="muted">The built-in lessons and practice work offline with no AI. The tutor uses a small on-device model, which is fine for hints but makes mistakes. With your own Claude API key, the tutor uses Claude whenever you're online, and it can write full lessons for any unit that doesn't have them yet. Usage is billed to your Anthropic account (a tutoring session typically costs a few cents). The key stays on this device and is never synced.</p>
     <div class="inline"><input type="password" id="cloudkey" placeholder="sk-ant-…" value="${cloudKey ? "••••••••" : ""}" autocomplete="off"><input id="cloudmodel" value="${esc(S.settings.cloudModel || "claude-sonnet-5-5")}" style="max-width:220px"><button class="primary" data-act="cloud-save">Save</button></div>
@@ -1269,7 +1320,7 @@ document.addEventListener("click", async (e) => {
       go("tutor"); break;
     }
     case "lstart": startLesson(a.dataset.unit, a.dataset.k !== undefined ? Number(a.dataset.k) : undefined); go("lesson/" + a.dataset.unit); break;
-    case "lgoto": ls = { ...ls, k: Number(a.dataset.k), phase: "teach", ex: 1, streak: 0, errs: 0 }; cur = null; render(); break;
+    case "lgoto": { const L = lessonFor(unitById(ls.uid)); ls = { ...ls, k: Number(a.dataset.k), phase: openingPhase(L[Number(a.dataset.k)]), ex: 1, streak: 0, errs: 0, firstDone: false }; cur = null; render(); break; }
     case "lphase": ls.phase = a.dataset.p; if (a.dataset.p === "example") ls.ex = 1; render(); break;
     case "lex": ls.ex++; render(); break;
     case "dgo": dg = null; cur = null; go("diag/" + a.dataset.unit); break;
@@ -1420,6 +1471,8 @@ document.addEventListener("change", async (e) => {
     if (t.dataset.assign !== undefined && t.value) { await assignFile(t.value, t.dataset.assign); lastUnmatched = lastUnmatched.filter((f) => f.key !== t.dataset.assign); toast("Assigned"); render(); }
     if (t.dataset.toggle) { const id = t.dataset.toggle; if (t.checked) enableCourse(id); else { S.enabled = S.enabled.filter((x) => x !== id); save(); } render(); }
     if (t.dataset.pref) { const p = (S.coursePrefs[t.dataset.pref] ||= {}); p[t.dataset.field] = t.dataset.field === "priority" ? Number(t.value) : t.value; save(); render(); }
+    if (t.dataset.prof) { S.profile = { ...(S.profile || DEFAULT_PROFILE), [t.dataset.prof]: t.value }; setProfile(S.profile); save(); render(); }
+    if (t.dataset.profset) { const k = t.dataset.profset, cur0 = new Set(S.profile?.[k] || []); t.checked ? cur0.add(t.value) : cur0.delete(t.value); S.profile = { ...(S.profile || DEFAULT_PROFILE), [k]: [...cur0] }; setProfile(S.profile); save(); render(); }
     if (t.dataset.set) { if (t.dataset.set === "maxSubjects") S.settings.maxSubjects = Math.max(1, Number(t.value) || 4); else S.settings.minutes[t.dataset.set] = Math.max(30, Number(t.value) || 120); save(); }
     if (draft && t.dataset.r && t.dataset.f === "type") { const [ui, ri] = t.dataset.r.split(":").map(Number); draft.pack.units[ui].resources[ri].type = t.value; }
     if (draft && t.dataset.move && t.value !== "") { const [ui, ri] = t.dataset.move.split(":").map(Number); const [r] = draft.pack.units[ui].resources.splice(ri, 1); draft.pack.units[Number(t.value)].resources.push(r); render(); }
@@ -1444,6 +1497,7 @@ async function boot() {
   try { const saved = await kvGet("state"); if (saved?.version) S = migrate(saved); } catch (e) { console.warn("Storage unavailable", e); }
   try { syncToken = (await kvGet("syncToken")) || null; cloudKey = (await kvGet("cloudKey")) || null; } catch {}
   S.timer = null;
+  S.profile ||= { ...DEFAULT_PROFILE }; setProfile(S.profile);
   invalidate(); render(); renderTimer();
   if (syncToken) syncNow();
   if ("serviceWorker" in navigator && location.protocol !== "file:") navigator.serviceWorker.register("./sw.js").catch((e) => console.warn("SW failed", e));

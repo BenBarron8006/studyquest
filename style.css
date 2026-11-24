@@ -207,3 +207,6 @@ ul.left { text-align: left; display: inline-block; }
 .cardrow[data-act] { cursor: pointer; }
 .tabs { flex-wrap: wrap; }
 #timerbar span { font-size: 14px; }
+.formal { margin: 14px 0; padding: 12px 14px; border-left: 3px solid var(--accent); background: var(--bg); border-radius: 0 12px 12px 0; line-height: 1.6; }
+.use { margin: 12px 0; padding: 10px 14px; border-radius: 12px; background: #2fb67c12; border: 1px solid #2fb67c44; }
+.use p { margin: 6px 0; }

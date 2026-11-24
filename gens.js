@@ -17,6 +17,11 @@ const pct = (x) => Math.round(x * 1000) / 10 + "%";
 // Multiple choice with the right answer shuffled in.
 function mc(q, right, wrongs, sol, hint) { const choices = shuffle([right, ...wrongs]); return { q, type: "mc", choices, a: choices.indexOf(right), sol, hint }; }
 
+// Personalization: when the learner's interests are set, generators sometimes write problems in those contexts.
+let PROFILE = { interests: [] };
+export function setProfile(p) { PROFILE = p || { interests: [] }; }
+const themed = (name) => PROFILE.interests?.includes(name) && Math.random() < 0.6;
+
 export const GEN = {
   /* ---------------- Probability, Ch. 1 ---------------- */
   diceSum() {
@@ -81,11 +86,28 @@ export const GEN = {
     return { q: `An urn has ${r} red and ${b} blue balls. Draw 2 without replacement. Probability the SECOND ball is red? (No information about the first.)`, type: "num", a: r / n, sol: `Total probability: ${r}/${n}·${r - 1}/${n - 1} + ${b}/${n}·${r}/${n - 1} = ${r}/${n}. By symmetry every position is equally likely to hold any given ball, so it's just ${frac(r, n)}.`, hint: "Split on what the first ball was, or think about symmetry." };
   },
   totalProb() {
+    if (themed("trading")) {
+      const pA = pick([0.3, 0.4, 0.6]), dA = pick([0.55, 0.6, 0.65]), dB = pick([0.45, 0.5, 0.52]);
+      const v = pA * dA + (1 - pA) * dB;
+      return { q: `${pct(pA)} of the trading days in your sample follow a hawkish National Bank headline. On those days the tenge strengthens ${pct(dA)} of the time; on other days ${pct(dB)} of the time. On what fraction of all days does the tenge strengthen?`, type: "num", a: v, sol: `Total probability: ${dA}·${pA} + ${dB}·${r4(1 - pA)} = ${r4(v)}.`, hint: "Split days by headline type, then take the weighted average." };
+    }
     const pA = pick([0.3, 0.4, 0.5, 0.6, 0.7]), dA = pick([0.01, 0.02, 0.03, 0.05]), dB = pick([0.02, 0.04, 0.06, 0.08]);
     const v = pA * dA + (1 - pA) * dB;
     return { q: `Factory A makes ${pct(pA)} of a company's phones and factory B the rest. ${pct(dA)} of A's phones are defective, and ${pct(dB)} of B's. What fraction of all phones are defective?`, type: "num", a: v, sol: `Law of total probability: P(D) = P(D|A)P(A) + P(D|B)P(B) = ${dA}·${pA} + ${dB}·${r4(1 - pA)} = ${r4(v)}.`, hint: "Split by which factory made the phone, then weight each defect rate by that factory's share." };
   },
   bayesTest() {
+    if (themed("trading")) {
+      const p = pick([0.2, 0.25, 0.3, 0.4]), se = pick([0.7, 0.8, 0.9]), fp = pick([0.1, 0.2, 0.3]);
+      const v = (p * se) / (p * se + (1 - p) * fp);
+      return { q: `Your hawk-o-meter reads central-bank statements. The bank hikes rates at ${pct(p)} of meetings. Before a hike, the statement reads hawkish ${pct(se)} of the time; before a non-hike, ${pct(fp)} of the time. Today's statement reads hawkish. Probability of a hike?`, type: "num", a: v,
+        sol: `Bayes: P(hike | hawkish) = P(hawkish | hike)P(hike) / P(hawkish) = (${se}·${p}) / (${se}·${p} + ${fp}·${r4(1 - p)}) = ${r4(p * se)} / ${r4(p * se + (1 - p) * fp)} ≈ ${r4(v)}. The base rate of hikes matters as much as the signal.`, hint: "Picture 100 meetings: how many are hikes with a hawkish statement, and how many non-hikes with one?" };
+    }
+    if (themed("philosophy")) {
+      const p = pick([0.01, 0.05, 0.1]), t = pick([0.8, 0.9, 0.95]);
+      const v = (p * t) / (p * t + (1 - p) * (1 - t));
+      return { q: `A witness who is right ${pct(t)} of the time reports that an unusual event happened. Such events happen ${pct(p)} of the time. Probability it really happened? (Hume's problem of testimony about miracles, in numbers.)`, type: "num", a: v,
+        sol: `P(event | report) = ${t}·${p} / (${t}·${p} + ${r4(1 - t)}·${r4(1 - p)}) ≈ ${r4(v)}. Hume's point: when the event is rare enough, even reliable testimony is more likely to be mistaken than the event is to have occurred.`, hint: "Compare true reports of a rare event with false reports of a common non-event." };
+    }
     const p = pick([0.001, 0.005, 0.01, 0.02, 0.05]), se = pick([0.9, 0.95, 0.98, 0.99]), sp = pick([0.9, 0.95, 0.98, 0.99]);
     const num = p * se, den = num + (1 - p) * (1 - sp), v = num / den;
     return { q: `A disease affects ${pct(p)} of people. A test catches it ${pct(se)} of the time when it's present (sensitivity) and correctly says “negative” ${pct(sp)} of the time when it's absent (specificity). You test positive. Probability you have the disease?`, type: "num", a: v,
@@ -97,6 +119,10 @@ export const GEN = {
     return { q: `Factory A makes ${pct(pA)} of phones (defect rate ${pct(dA)}); factory B makes the rest (defect rate ${pct(dB)}). A random phone is defective. Probability it came from A?`, type: "num", a: v, sol: `P(A|D) = P(D|A)P(A)/P(D) = (${dA}·${pA}) / (${dA}·${pA} + ${dB}·${r4(1 - pA)}) ≈ ${r4(v)}.`, hint: "Bayes' rule: flip P(D|A) into P(A|D). The denominator is the total defect rate." };
   },
   indep() {
+    if (themed("trading") && Math.random() < 0.5) {
+      const a = pick([0.1, 0.2, 0.3]), b = pick([0.15, 0.25, 0.4]);
+      return { q: `Two trading signals fire independently: the news signal on ${pct(a)} of days, the oil-price signal on ${pct(b)} of days. On what fraction of days does at least one fire?`, type: "num", a: a + b - a * b, sol: `P(A∪B) = ${a} + ${b} − ${a}·${b} = ${r4(a + b - a * b)}. (Or 1 − (1−${a})(1−${b}).) Independence is an assumption here: news and oil prices are often linked.`, hint: "Complement: neither fires." };
+    }
     const a = pick([0.2, 0.3, 0.4, 0.5, 0.6]), b = pick([0.1, 0.25, 0.5, 0.7, 0.8]), t = ri(0, 2);
     if (t === 0) return { q: `A and B are independent with P(A) = ${a} and P(B) = ${b}. Find P(A or B).`, type: "num", a: a + b - a * b, sol: `P(A∪B) = P(A) + P(B) − P(A∩B), and independence gives P(A∩B) = ${a}·${b} = ${r4(a * b)}. So ${r4(a + b - a * b)}.`, hint: "Inclusion–exclusion, with P(A∩B) = P(A)P(B)." };
     if (t === 1) return { q: `A and B are independent with P(A) = ${a} and P(B) = ${b}. Probability that neither happens?`, type: "num", a: (1 - a) * (1 - b), sol: `If A and B are independent so are their complements: (1 − ${a})(1 − ${b}) = ${r4((1 - a) * (1 - b))}.`, hint: "Neither = (not A) and (not B)." };
@@ -117,11 +143,18 @@ export const GEN = {
     return { q: `X has PMF P(X=0) = ${probs[0]}, P(X=1) = ${probs[1]}, P(X=2) = ${probs[2]}, P(X=3) = ${probs[3]}. What is the CDF F(${x}) = P(X ≤ ${x})?`, type: "num", a: v, sol: `F(${x}) adds P(X = j) for every j ≤ ${x}: ${probs.slice(0, k + 1).join(" + ")} = ${r4(v)}.${x !== k ? " The CDF is flat between integers, so F(" + x + ") = F(" + k + ")." : ""}`, hint: "F(x) = P(X ≤ x): add up the PMF up to x." };
   },
   binom() {
+    if (themed("trading") && Math.random() < 0.7) {
+      const n = pick([5, 8, 10]), k = Math.ceil(n * 0.7), p = 0.5;
+      let v = 0; for (let j = k; j <= n; j++) v += C(n, j) * 0.5 ** n;
+      return { q: `A signal with no skill calls the tenge's daily direction right with probability 0.5, independently each day. Over ${n} days, what is the probability it is right on at least ${k} days just by luck?`, type: "num", a: v,
+        sol: `X ~ Bin(${n}, 0.5). P(X ≥ ${k}) = Σ_{j=${k}}^{${n}} C(${n},j)/2^${n} ≈ ${r4(v)}. This is why a short winning streak proves little: luck alone does it this often.`, hint: "Add the binomial probabilities for every count from the threshold up." };
+    }
     const n = ri(4, 12), p = pick([0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6]), q = Math.round((1 - p) * 100) / 100;
     if (Math.random() < 0.65) { const k = ri(1, Math.min(n - 1, 5)), v = C(n, k) * p ** k * q ** (n - k); return { q: `X ~ Bin(${n}, ${p}). Find P(X = ${k}).`, type: "num", a: v, sol: `P(X=k) = C(n,k) p^k (1−p)^(n−k) = C(${n},${k}) · ${p}^${k} · ${q}^${n - k} = ${C(n, k)} · ${r4(p ** k)} · ${r4(q ** (n - k))} ≈ ${r4(v)}.`, hint: "C(n,k) counts which trials succeed; p^k(1−p)^(n−k) is the chance of any one such pattern." }; }
     const v = 1 - q ** n; return { q: `A free-throw shooter makes each shot independently with probability ${p}. In ${n} shots, what is the probability she makes at least one?`, type: "num", a: v, sol: `X ~ Bin(${n}, ${p}). P(X ≥ 1) = 1 − P(X = 0) = 1 − ${q}^${n} ≈ ${r4(v)}.`, hint: "Use the complement: zero successes." };
   },
   hyper() {
+    if (themed("trading") && Math.random() < 0.5) { const w = ri(6, 12), b = ri(10, 20), n = ri(4, 6), k = ri(1, Math.min(3, n)), v = (C(w, k) * C(b, n - k)) / C(w + b, n); return { q: `Of ${w + b} central-bank statements in your archive, ${w} were followed by a hike. You pick ${n} at random (no repeats) to hand-label. Probability exactly ${k} of them were followed by a hike?`, type: "num", a: v, sol: `Hypergeometric: C(${w},${k})·C(${b},${n - k}) / C(${w + b},${n}) ≈ ${r4(v)}.`, hint: "Choose the hike statements and the others separately." }; }
     if (Math.random() < 0.5) { const k = ri(0, 3), v = (C(13, k) * C(39, 5 - k)) / C(52, 5); return { q: `A 5-card hand is dealt from a standard 52-card deck. Probability it contains exactly ${k} hearts?`, type: "num", a: v, sol: `Hypergeometric: C(13,${k})·C(39,${5 - k}) / C(52,5) = ${C(13, k)}·${C(39, 5 - k)} / ${C(52, 5)} ≈ ${r4(v)}.`, hint: "Choose the hearts from the 13 hearts and the rest from the 39 non-hearts." }; }
     const w = ri(4, 10), b = ri(4, 10), n = ri(3, 5), k = ri(1, Math.min(n, w)), v = (C(w, k) * C(b, n - k)) / C(w + b, n);
     return { q: `An urn has ${w} white and ${b} black balls. Draw ${n} without replacement. Probability exactly ${k} are white?`, type: "num", a: v, sol: `X ~ HGeom(${w}, ${b}, ${n}): C(${w},${k})·C(${b},${n - k}) / C(${w + b},${n}) = ${C(w, k) * C(b, n - k)}/${C(w + b, n)} ≈ ${r4(v)}.`, hint: "Same structure as a committee problem." };
